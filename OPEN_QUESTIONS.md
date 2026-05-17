@@ -79,3 +79,15 @@ with a date.
 
 _None yet — this section will grow as questions get answered._
 
+
+## Stage 3 follow-ups (deferred)
+
+- Retrieval self-test preview length: bump from 100 to 200 chars in
+  betty_etl.retrieval._self_test and actor._self_test trace output.
+  100 chars hid section-header context that mattered for grounding
+  verification.
+- Measure warm-turn KV cache effect: run actor self-test twice with
+  identical Markdown OS, compare turn-1 vs turn-2 latency. If turn 2
+  is materially faster, prefix caching is working. If not, investigate
+  before Stage 4 adds Judge round-trips.
+

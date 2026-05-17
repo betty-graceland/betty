@@ -128,3 +128,110 @@ context delivered through a stable-prefix Markdown OS system prompt.
    existed only on local disk until this session.
 
 **Next:** Stage 4 — Judge adapter (Claude 3.5 Sonnet) + draft_email tool.
+# Betty Build Status — Stage 3 Complete
+*Handback briefing dated 2026-05-17*
+
+## TL;DR
+
+Betty can now talk. The full read-think-respond loop is wired and verified end-to-end. Stages 1-3 are complete, committed, and reproducible from self-tests.
+
+Stage 4 (Judge adapter + first action tool) is next.
+
+## What Works Right Now
+
+A natural-language question from Peter goes through:
+1. `pipeline.ingest_file()` for new PDFs → checksum-idempotent storage in pgvector with HNSW indexing
+2. `actor.actor_turn(question)` → retrieves top-K relevant chunks, assembles Markdown OS system prompt, calls betty-generalist via Ollama
+3. Betty responds in her own voice, citing sources by document title, grounded in retrieved evidence
+
+End-to-end latency: ~25s first turn against a substantive question (1957 tokens in, 659 tokens out, ~34 tok/s sustained).
+
+## Architecture Locked-In (Stages 1-3)
+
+**Substrate:** Postgres 16.13 + pgvector 0.8.2 in Docker on port 5433. HNSW index on `vector_cosine_ops`. Idempotency via UNIQUE on `checksum_sha256`. Chunk char offsets live in `metadata` jsonb, not as columns.
+
+**ETL:** Python 3.12 via pyenv, uv workspace with `etl/` and `openclaw/` as sibling members, single shared `.venv` at workspace root. Hard-pinned deps. Nomic 768d embeddings with `search_document` / `search_query` prefix discipline.
+
+**Actor:** betty-generalist (Qwen 3 14.8B Q4_K_M) via Ollama, accessed through httpx-based client. Markdown OS loaded in strict order — AGENTS → USER → MEMORY — for KV prefix caching. Retrieved context goes into user message, not system, to keep prefix stable across turns.
+
+**Models locked:**
+| Role | Model | Source |
+|------|-------|--------|
+| Actor (Stage 3+) | betty-generalist (Qwen 3 14.8B Q4_K_M) | Ollama, ~34 tok/s, ~25s first turn |
+| Embedder | nomic-embed-text v1.5 (768d) | sentence-transformers in-process |
+| Judge (Stage 4+) | Claude 3.5 Sonnet | Anthropic API — not yet wired |
+| Reflector (Stage 9+) | betty-primary (Qwen 3.5 MoE 36B-A3B Q4) | Ollama, parked warm |
+
+## Critical Gotchas Discovered in Stage 3
+
+1. **Qwen 3 thinking tokens consume the budget.** Reasoning-capable models emit a separate `message.thinking` field. With default `num_predict=100`, the entire budget got consumed by reasoning before any visible content. Fix: raise default to 1024, capture thinking into `ChatResponse.thinking` separately from `.content`. Don't merge them — actor sees only `.content` so Betty's voice stays clean. Stage 9 reflector can use `.thinking` later.
+
+2. **`/no_think` directive doesn't work for Qwen 3.5.** Tested explicitly. The model produces *more* tokens with the directive, not fewer. We can't suppress thinking; we budget for it.
+
+3. **uv workspace requires explicit member dependencies at root.** `dependencies = []` makes the root a "virtual" project that doesn't install workspace members. Fix: declare `dependencies = ["betty-etl", "betty-openclaw"]` at root, plus `[tool.uv.sources]` block telling uv these resolve to the workspace.
+
+4. **Stage 2 ETL files were never committed.** Entire pipeline existed only on local disk until this session. Build log instruction: every session, `git status` before closing.
+
+5. **Schema-source-of-truth drift.** Earlier in Stage 2, work proceeded against a pasted version of `001_init.sql` that didn't match the live database. Real schema lives at `~/code/betty/ops/schema/001_init.sql`. Always `cat` the file rather than trusting in-conversation pastes.
+
+6. **HNSW index uses `vector_cosine_ops`** (live schema), not `vector_ip_ops`. Retrieval uses `<=>` operator.
+
+7. **Nomic empty prompts dict.** `nomic-ai/nomic-embed-text-v1.5` in sentence-transformers 3.3.1 ships with `model.prompts = {}`. Must manually register `search_document` and `search_query` after model load.
+
+## Project Layout
+~/code/betty/                           # uv workspace root
+├── ARCHITECTURE.md
+├── BUILD_LOG.md
+├── OPEN_QUESTIONS.md
+├── pyproject.toml                      # workspace declaration
+├── uv.lock                             # shared lockfile
+├── .venv/                              # single shared venv
+├── .python-version                     # 3.12.13
+├── docker/
+│   ├── docker-compose.yml
+│   └── .env                            # gitignored
+├── ops/schema/
+│   ├── 001_init.sql                    # the real schema, source of truth
+│   └── apply.sh
+├── etl/                                # workspace member: OpenBrain
+│   ├── pyproject.toml
+│   └── betty_etl/
+│       ├── config.py
+│       ├── chunking.py
+│       ├── embeddings.py               # embed_chunks, embed_query
+│       ├── db.py                       # pool, ingest_document
+│       ├── pipeline.py                 # ingest_file → IngestResult
+│       ├── retrieval.py                # retrieve → RetrievalHit
+│       └── extractors/pdf.py
+└── openclaw/                           # workspace member: actor
+    ├── pyproject.toml
+    └── betty_openclaw/
+        ├── ollama_client.py            # httpx wrapper, /api/chat
+        ├── actor.py                    # actor_turn()
+        └── betty_os/
+            ├── AGENTS.md               # identity, immutable
+            ├── USER.md                 # operator profile, stable
+            └── MEMORY.md               # volatile working set
+
+## Verified Self-Tests
+
+All runnable from workspace root via `uv run python -m ...`:
+- `betty_etl.chunking` — 52 chunks from Attention paper, avg 878 chars
+- `betty_etl.embeddings` — 768d vectors, L2 norm 1.0, Nomic on MPS
+- `betty_etl.db` — pool ping, ingest, idempotency check
+- `betty_etl.pipeline --self-test` — extract→chunk→embed→ingest, all 4 paths
+- `betty_etl.retrieval` — top sim 0.81 on "self-attention mechanism"
+- `betty_openclaw.ollama_client` — chat with thinking captured separately
+- `betty_openclaw.actor` — full chain, Betty cites Attention paper by title
+
+## Build Stage Sequence
+
+1. Substrate ✓
+2. ETL Skeleton ✓
+3. Local Actor ✓
+4. **Judge Adapter** ← next
+5. Review Queue UI
+6. REVISE Loop
+7. Heartbeat
+8. Work Records + Intent Parameters
+9. Reflection Loop
