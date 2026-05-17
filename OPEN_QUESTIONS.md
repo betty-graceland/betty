@@ -91,3 +91,15 @@ _None yet — this section will grow as questions get answered._
   is materially faster, prefix caching is working. If not, investigate
   before Stage 4 adds Judge round-trips.
 
+
+## Stage 4 first-task case study (deferred)
+
+- Clean up `~/.openclaw/` — the data directory from the previous
+  npm-openclaw install. Contains symlinks pointing to real project
+  files (discovered 2026-05-17 during naming collision resolution).
+  Cannot safely `rm -rf` without verifying each symlink target.
+  Save as Stage 4 demonstration: Betty proposes the cleanup,
+  Judge approves only the non-symlink portions, symlinks get
+  individual review. Real test of the proposal-then-approve loop
+  against a non-trivial filesystem action.
+
