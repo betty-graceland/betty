@@ -235,3 +235,85 @@ All runnable from workspace root via `uv run python -m ...`:
 7. Heartbeat
 8. Work Records + Intent Parameters
 9. Reflection Loop
+# Side-Note for Gemini: Naming Collision Resolved
+
+*Dated 2026-05-17, after Stage 3 closeout*
+
+## What happened
+
+After committing Stage 3 (commit dd7d660), Peter sent a Telegram message
+intending to talk to "Betty." Telegram returned a response showing
+🛠️ Exec tool calls referencing paths under `openclaw/workspace/travelpec-com`.
+
+This caused brief confusion: the system we built tonight has no Telegram
+bridge, no exec capability, no workspace directory, and no tool execution.
+Initial concern was that an unauthorized agent was operating on real
+project files.
+
+## What it actually was
+
+Peter had previously `npm install -g openclaw` — Mario Zechner's
+agent framework. The Node process (PID 1093) had been running quietly
+since Tuesday 9pm, configured with Telegram + tool execution + workspace
+mappings pointing at his real repos.
+
+When Peter typed "finish building travelpec.com" into Telegram, it went
+to npm-openclaw — not to the Python betty_openclaw we built this session.
+The two systems share only a name.
+
+## Verified safe
+
+- `git status` on travelpec-site: clean, no modifications
+- `git log` shows latest commit from May 11 (Peter's own work)
+- All file mtimes pre-date today
+- Peter sent "Stop" before any exec actually fired
+- The Node process logged "Agent was aborted" cleanly
+
+No files were modified. No commits made. No damage of any kind.
+
+Process has been killed (`kill 1093`).
+
+## The naming problem this surfaces
+
+Two systems on Peter's machine called "openclaw":
+
+1. **npm-openclaw** — Mario Zechner's framework at
+   `/opt/homebrew/lib/node_modules/openclaw/` with data in `~/.openclaw/`
+2. **python-openclaw** — Our Stage 3 workspace member at
+   `~/code/betty/openclaw/` (the betty_openclaw package)
+
+The name "OpenClaw" in ARCHITECTURE.md was always *conceptual* — it
+described the actor's role in the broader system, not a specific
+product. The collision is accidental.
+
+## Resolution chosen
+
+Rename the Python package before Stage 4 begins, to eliminate the
+collision permanently. The npm framework stays available if Peter ever
+wants to use it for other purposes; our Python Betty gets a clean,
+unambiguous name.
+
+Likely rename: `betty_openclaw` → `betty_claw` or `betty_actor`.
+Trivial refactor: rename the package, update imports in actor.py and
+the workspace pyproject.toml, re-run self-tests, commit.
+
+## What changes for Stage 4
+
+Nothing functional. Stage 4's blueprint (Anthropic client → stub
+tool → Judge wiring) is unchanged. The rename is a 10-minute warm-up
+task at the start of the Stage 4 session, before the real work begins.
+
+The architectural intent — Stage 4 introduces the *first external
+action with a safety boundary* — remains exactly as drafted in the
+Stage 3 handback.
+
+## Meta-lesson for the build log
+
+When standing up agent systems with tool execution, name collisions
+between conceptual architecture and installed software are an actual
+operational hazard. They look like they're working when they aren't,
+or worse, look like they aren't working when they are. Worth a line
+in OPEN_QUESTIONS.md: "Before installing any agent framework named
+after architecture concepts (claw, brain, judge, etc.), verify no
+name collision with planned Python packages."
+
