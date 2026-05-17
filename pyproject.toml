@@ -1,0 +1,17 @@
+[project]
+name = "betty"
+version = "0.1.0"
+description = "Betty — local-first autonomous personal business AI"
+requires-python = "==3.12.*"
+
+dependencies = [
+    "betty-etl",
+    "betty-openclaw",
+]
+
+[tool.uv.workspace]
+members = ["etl", "openclaw"]
+
+[tool.uv.sources]
+betty-etl = { workspace = true }
+betty-openclaw = { workspace = true }

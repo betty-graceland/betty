@@ -1,0 +1,24 @@
+[project]
+name = "betty-openclaw"
+version = "0.1.0"
+description = "Betty actor: Markdown OS, Ollama client, conversation loop"
+requires-python = "==3.12.*"
+authors = [{ name = "Betty Graceland", email = "betty@benesthemenace.com" }]
+
+dependencies = [
+    "betty-etl",       # workspace dep — for retrieval
+    "httpx==0.28.1",   # Ollama HTTP client
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "ruff==0.8.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["betty_openclaw"]

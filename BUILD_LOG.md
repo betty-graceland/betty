@@ -61,3 +61,33 @@ end-to-end vector query works.
 
 ---
 
+
+---
+
+## 2026-05-17 — Stage 3 Read-Path Complete
+
+**Goal:** Wire query-side embedding + cosine retrieval against the
+OpenBrain pgvector substrate.
+
+**Built:**
+- `embed_query()` added to `embeddings.py` using Nomic's `search_query`
+  prefix (registered centrally in `_load_model` so both embed paths
+  share state via lru_cache)
+- `retrieval.py` with `RetrievalHit` dataclass and `retrieve()` function
+- Workspace/project/source_kind filters pushed into SQL WHERE clause so
+  HNSW lookup honors tenant boundaries
+- Char offsets extracted from chunk `metadata` jsonb (per Stage 2's
+  schema decision to use jsonb instead of dedicated columns)
+
+**Verified against "Attention Is All You Need":**
+- "self-attention mechanism" → top hit chunk 7 at sim=0.8117
+- "multi-head attention" → top hit chunk 15 at sim=0.7619
+- "how do transformers handle long sequences" → top hit chunk 38 at sim=0.6742
+- Three distinct top hits proves `search_query` prefix is wired correctly
+- Char offsets populated and traceable back to source (chunk 7 at chars 5244-6144)
+
+**Performance:** Retrieval is effectively free (~50ms dominated by
+single Nomic forward pass for the query embedding). Actor latency will
+dominate end-to-end response time once Stage 3 wires Qwen.
+
+**Stage 3 remaining:** Ollama client, minimal Markdown OS, actor loop.
