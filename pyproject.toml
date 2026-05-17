@@ -6,12 +6,12 @@ requires-python = "==3.12.*"
 
 dependencies = [
     "betty-etl",
-    "betty-openclaw",
+    "betty-claw",
 ]
 
 [tool.uv.workspace]
-members = ["etl", "openclaw"]
+members = ["etl", "claw"]
 
 [tool.uv.sources]
 betty-etl = { workspace = true }
-betty-openclaw = { workspace = true }
+betty-claw = { workspace = true }

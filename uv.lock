@@ -5,8 +5,8 @@ requires-python = "==3.12.*"
 [manifest]
 members = [
     "betty",
+    "betty-claw",
     "betty-etl",
-    "betty-openclaw",
 ]
 
 [[package]]
@@ -27,15 +27,39 @@ name = "betty"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "betty-claw" },
     { name = "betty-etl" },
-    { name = "betty-openclaw" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "betty-claw", editable = "claw" },
+    { name = "betty-etl", editable = "etl" },
+]
+
+[[package]]
+name = "betty-claw"
+version = "0.1.0"
+source = { editable = "claw" }
+dependencies = [
+    { name = "betty-etl" },
+    { name = "httpx" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "betty-etl", editable = "etl" },
-    { name = "betty-openclaw", editable = "openclaw" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.4" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.8.4" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "betty-etl"
@@ -72,30 +96,6 @@ requires-dist = [
     { name = "sentence-transformers", specifier = "==3.3.1" },
     { name = "torch", specifier = "==2.5.1" },
     { name = "tqdm", specifier = "==4.67.1" },
-]
-provides-extras = ["dev"]
-
-[[package]]
-name = "betty-openclaw"
-version = "0.1.0"
-source = { editable = "openclaw" }
-dependencies = [
-    { name = "betty-etl" },
-    { name = "httpx" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "betty-etl", editable = "etl" },
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.4" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.8.4" },
 ]
 provides-extras = ["dev"]
 

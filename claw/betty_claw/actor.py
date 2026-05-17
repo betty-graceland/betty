@@ -34,7 +34,7 @@ from typing import Any
 
 from betty_etl.retrieval import RetrievalHit, retrieve
 
-from betty_openclaw.ollama_client import (
+from betty_claw.ollama_client import (
     ChatMessage,
     ChatResponse,
     OllamaClient,
