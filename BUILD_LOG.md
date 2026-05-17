@@ -91,3 +91,40 @@ single Nomic forward pass for the query embedding). Actor latency will
 dominate end-to-end response time once Stage 3 wires Qwen.
 
 **Stage 3 remaining:** Ollama client, minimal Markdown OS, actor loop.
+
+---
+
+## 2026-05-17 — Stage 3 Complete: Actor Wiring
+
+**Goal:** Wire betty-generalist as the routine actor, with retrieval
+context delivered through a stable-prefix Markdown OS system prompt.
+
+**Built:**
+- `openclaw/` as workspace sibling to `etl/`, single shared .venv
+- `betty_os/AGENTS.md`, `USER.md`, `MEMORY.md` — load order locked
+  (immutable → stable → volatile) for Ollama KV prefix caching
+- `ollama_client.py` — httpx wrapper around /api/chat with thinking
+  content captured separately from visible response
+- `actor.py` — actor_turn() stitches Markdown OS + retrieval + Ollama
+
+**Model decisions locked:**
+- Actor: betty-generalist (Qwen 3 14.8B Q4_K_M) ~34 tok/s sustained
+- Reflector (Stage 9): betty-primary (Qwen 3.5 MoE 36B-A3B) parked
+
+**Verified end-to-end on Attention paper query:**
+- Retrieval surfaced 5 chunks from sim=0.77 down to 0.67
+- Betty produced grounded summary citing source by document title
+- Stayed in retrieved evidence (no hallucinated facts)
+- Voice matched AGENTS.md constraints
+- First-turn latency: 25.00s (1957 tokens in, 659 tokens out)
+
+**Gotchas resolved:**
+1. Qwen 3 reasoning consumed entire 100-token budget before producing
+   visible content. Fix: raise DEFAULT_NUM_PREDICT to 1024 and capture
+   thinking content into a separate field, not merged with response.
+2. uv workspace required explicit `dependencies = [members]` at root
+   to actually install members into shared venv.
+3. Stage 2 ETL files had never been committed — entire pipeline
+   existed only on local disk until this session.
+
+**Next:** Stage 4 — Judge adapter (Claude 3.5 Sonnet) + draft_email tool.
