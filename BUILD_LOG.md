@@ -317,3 +317,76 @@ in OPEN_QUESTIONS.md: "Before installing any agent framework named
 after architecture concepts (claw, brain, judge, etc.), verify no
 name collision with planned Python packages."
 
+# Stage 4 Kickoff — Locked Decisions
+
+*Prepared 2026-05-17 after empirical Judge model comparison.*
+
+## Context
+
+Stages 1-3 complete and verified. Stage 4 introduces external action capability with a safety boundary: Betty proposes actions via Qwen 3 (local), and the Judge (Anthropic API) evaluates each proposal before execution. This is the first stage where external API spend is real and where failures have consequences beyond test output.
+
+Repo: ~/code/betty/ — uv workspace, etl/ + claw/ as sibling members, single shared venv.
+
+Final commit before Stage 4: 01c6db9 (rename openclaw to claw).
+
+## Locked decisions
+
+1. **API key storage:** ~/code/betty/.env (root-level, gitignored, mirrors docker/.env pattern). Loaded via python-dotenv.
+
+2. **Tool calling protocol:** Ollama's native tools parameter for Qwen 3. The actor receives tool definitions and returns structured tool calls in the response; basic schema validation in actor.py before passing to Judge.
+
+3. **Judge model:** claude-opus-4-7 — single-stage Judge.
+
+   Rationale: empirically tested against Haiku 4.5 and Sonnet 4.6 on two scenarios (schedule_meeting with embedded date/timezone errors; publish_shopify_product_description with embedded regulatory/SEO/safety issues). Opus 4.7 caught the union of all concerns both smaller models flagged plus 4 additional real concerns neither smaller model surfaced, with zero hallucinations across both tests. Sonnet 4.6 hallucinated a day-of-week in test 1 (claimed May 27 was a Thursday — it is a Wednesday). Opus analysis included cross-context reasoning that connected proposed actions back to original user briefs (e.g., flagging keyword stuffing as inconsistent with Peter stated "design-forward, slightly aspirational" audience requirement). Cost per Judge call: ~$0.025, comparable to a two-stage Haiku+Sonnet pattern but with strictly broader coverage.
+
+   Model string lives in .env as ANTHROPIC_JUDGE_MODEL so it can be swapped without code changes if production evidence later supports a different model.
+
+4. **Verdict space:** approve/reject only. "Revise" is deferred to Stage 6 where the revise loop will actually exist to use it. YAGNI.
+
+5. **Proposal storage:** JSON files at ~/code/betty/claw/proposals/<uuid>.json. Filesystem visibility is valuable for debugging the first LLM-to-LLM loop. Migrate to Postgres in Stage 5 when the review UI needs to query them.
+
+6. **Circuit breaker (critical):** Hard cap of 3 Judge rejections per actor turn. Soft cap of $5.00/day cumulative Anthropic API spend. Either cap trips, halt and escalate. Daily spend ledger at ~/code/betty/claw/spend-ledger.json, rolled daily.
+
+7. **Judge prompt:** String constant in judge.py. Code-coupled, not user-configurable. Not a Markdown OS file.
+
+## Implementation order (locked from Gemini review: contracts before transport)
+
+**Phase 4.1 — Foundations:**
+- claw/betty_claw/types.py — ToolCall, ToolResult, JudgeVerdict, SpendLedger dataclasses
+- claw/betty_claw/anthropic_client.py — httpx wrapper around Messages API, loads key from .env, returns structured response with token counts. Includes _self_test() that pings Claude with "Respond with the single word OK" and asserts content == "OK"
+
+**Phase 4.2 — Stub tool:**
+- claw/betty_claw/tools/__init__.py
+- claw/betty_claw/tools/draft_email.py — does NOT send email. Returns ToolResult(status="proposed", ...) and writes proposal JSON to claw/proposals/<uuid>.json. Self-test: call with valid args, verify proposal file written.
+
+**Phase 4.3 — Judge wiring:**
+- claw/betty_claw/judge.py — Judge prompt as string constant; before_tool_call(tool_call, user_request) -> JudgeVerdict function; circuit breaker logic (3-rejection cap, spend ledger check); spend ledger read/write
+- Modify claw/betty_claw/actor.py — detect tool calls in Qwen response (via Ollama tools parameter), route through judge before execution
+- Self-test: two scenarios — (a) Betty drafts benign email, Judge approves, proposal file written; (b) Betty asked to do something obviously rejectable, Judge rejects with reasoning
+
+## Models active in .env
+
+ANTHROPIC_API_KEY=sk-ant-xxx
+ANTHROPIC_JUDGE_MODEL=claude-opus-4-7
+DAILY_SPEND_CAP_USD=5.00
+TURN_REJECTION_CAP=3
+
+## Critical safety properties Stage 4 must guarantee
+
+1. No tool executes without Judge approval (the safety boundary is the whole point)
+2. Daily API spend cannot exceed cap (the financial safety boundary)
+3. Repeated rejections within one turn halt the loop (the runaway-loop boundary)
+4. Spend ledger persists across restarts (otherwise cap is per-process, not per-day)
+5. Failed Anthropic API calls (network, auth, deprecation) fail safe — tool does NOT execute on Judge failure
+
+## Open questions for after Stage 4
+
+- KV cache verification (deferred from Stage 3) — measure turn-2 latency with Markdown OS prefix unchanged
+- Heartbeat latency budget (Stage 7) — 25s first-turn currently too long for 30-min tick
+- Whether Opus 4.7 is overkill in practice; reassess after 50-100 real Judge calls
+
+## What to do when starting the implementation chat
+
+Start a fresh Claude chat. Paste this entire kickoff document. First message after: "Begin Phase 4.1. Implement types.py and anthropic_client.py per the locked decisions above."
+
+Do not implement multiple phases in one message. Each phase gets implemented, tested, committed before the next phase begins. This is the rhythm Stages 1-3 used successfully.
