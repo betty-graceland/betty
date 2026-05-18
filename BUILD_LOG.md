@@ -421,3 +421,39 @@ First `.env` write produced a malformed key with duplicated `sk-ant-` prefix. Th
 - `claw/betty_claw/tools/__init__.py`
 - `claw/betty_claw/tools/draft_email.py` — does NOT send. Returns `ToolResult(status="proposed", ...)`, writes proposal JSON to `~/code/betty/claw/proposals/<uuid>.json`.
 - First end-to-end exercise of `ToolCall` -> `ToolResult` shapes with zero real-world side effect.
+
+## Stage 5 Architectural Commitments
+
+### AI-disclosure footer on outbound emails (logged Phase 4.2)
+
+When Stage 5 or 6 wires real email execution (replacing the Phase 4.2 stub),
+outbound emails sent by Betty MUST carry a footer that explicitly identifies
+the message as AI-generated and disclaims promises/claims requiring human
+verification.
+
+Working footer text (refine in Stage 5):
+
+  This message was sent by Betty, an AI agent acting on behalf of Peter
+  Benes. Content may contain errors. Any commitments, promises, or factual
+  claims should be verified directly with Peter before being relied upon.
+
+Architectural properties:
+
+1. The footer is appended at execution time in the send tool, NOT in the
+   proposal. The proposal JSON captures the user-facing body; the footer
+   is a property of the send operation. This keeps proposals reviewable
+   as the message-the-actor-intended-to-send.
+
+2. The footer is not optional and not bypassable by the actor. It is
+   hardcoded into the send tool, not passed as an argument. Qwen cannot
+   suppress it via prompt manipulation, tool-call argument injection, or
+   any other channel reachable from the actor surface.
+
+3. The Judge prompt (Phase 4.3) must be aware the footer will be
+   auto-appended at execution time, so it does NOT reject proposals for
+   "missing AI disclosure" when the disclosure is added downstream. The
+   Judge evaluates the body as-proposed; the footer is a guaranteed
+   downstream invariant outside the Judge's verdict scope.
+
+No code changes in Phase 4.2. This is a logged decision to prevent
+re-litigation in future sessions.
