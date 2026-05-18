@@ -390,3 +390,34 @@ TURN_REJECTION_CAP=3
 Start a fresh Claude chat. Paste this entire kickoff document. First message after: "Begin Phase 4.1. Implement types.py and anthropic_client.py per the locked decisions above."
 
 Do not implement multiple phases in one message. Each phase gets implemented, tested, committed before the next phase begins. This is the rhythm Stages 1-3 used successfully.
+
+## Stage 4.1 — Foundations (complete)
+
+**Commits:** bd903b5, ee11a1f, ff0139c
+
+### What landed
+- `claw/pyproject.toml`: added `python-dotenv>=1.0.1`
+- `claw/betty_claw/types.py`: four frozen dataclasses — `ToolCall`, `ToolResult`, `JudgeVerdict`, `SpendLedger`. Frozen enforcement verified via `FrozenInstanceError` on attempted mutation.
+- `claw/betty_claw/anthropic_client.py`: httpx wrapper, mirrors `ollama_client.py` posture. Loads `.env` from repo root via path anchored to `__file__`. Two custom exceptions (`AnthropicAPIError`, `AnthropicResponseError`) under common `AnthropicClientError` base for fail-safe Judge semantics.
+
+### Design notes worth preserving
+- `call_id` (UUID4) is the universal join key across `ToolCall` -> `JudgeVerdict` -> `ToolResult` -> proposal JSON filename. Single identifier traces a proposal through the whole pipeline.
+- Per-turn rejection counting was initially proposed inside `SpendLedger` and removed during design review. Transient per-turn state lives in-memory in the Judge instance; the ledger is dollars only.
+- Opus 4.7 pricing constants: `INPUT_COST_PER_MTOK = 15.00`, `OUTPUT_COST_PER_MTOK = 75.00`. Verified to six decimals against live API response.
+
+### Verified day-zero baselines
+- First live Anthropic API call: `content='OK'`, 31 input tokens, 6 output tokens, **cost $0.000915**, `stop_reason=end_turn`, model resolved to `claude-opus-4-7`.
+- Implied headroom: ~200 Judge calls at the kickoff's $0.025-per-call estimate before $5/day cap.
+
+### Incident: model-string drift
+Mid-session, a user message proposed swapping the Judge model from the kickoff-locked `claude-opus-4-7` to `claude-3-7-sonnet-20250219`. Assistant rejected the swap because (a) it contradicted the kickoff's empirical justification, (b) the proposed string is an older generation than the Sonnet 4.6 that already failed the day-of-week test that justified Opus 4.7. User confirmed the swap was a temporal continuity error. Kept Opus 4.7.
+
+**Discipline preserved:** locked decisions in the kickoff document are the source of truth, even against in-session counter-suggestions. Future sessions: re-verify kickoff before swapping load-bearing components.
+
+### Incident: API key leak (caught and remediated)
+First `.env` write produced a malformed key with duplicated `sk-ant-` prefix. The malformed string was pasted into chat during verification. Even though malformed, the recoverable substring was treated as compromised. Key revoked on console.anthropic.com, fresh key provisioned, never echoed again. Length-check helper (`awk` over `~/.env`) added to verify key shape without revealing contents.
+
+### Next session opens with Phase 4.2
+- `claw/betty_claw/tools/__init__.py`
+- `claw/betty_claw/tools/draft_email.py` — does NOT send. Returns `ToolResult(status="proposed", ...)`, writes proposal JSON to `~/code/betty/claw/proposals/<uuid>.json`.
+- First end-to-end exercise of `ToolCall` -> `ToolResult` shapes with zero real-world side effect.
