@@ -44,6 +44,7 @@ source = { editable = "claw" }
 dependencies = [
     { name = "betty-etl" },
     { name = "httpx" },
+    { name = "python-dotenv" },
 ]
 
 [package.optional-dependencies]
@@ -57,6 +58,7 @@ requires-dist = [
     { name = "betty-etl", editable = "etl" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.4" },
+    { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.8.4" },
 ]
 provides-extras = ["dev"]

@@ -8,6 +8,7 @@ authors = [{ name = "Betty Graceland", email = "betty@benesthemenace.com" }]
 dependencies = [
     "betty-etl",       # workspace dep — for retrieval
     "httpx==0.28.1",   # Ollama HTTP client
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
