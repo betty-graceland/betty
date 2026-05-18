@@ -457,3 +457,73 @@ Architectural properties:
 
 No code changes in Phase 4.2. This is a logged decision to prevent
 re-litigation in future sessions.
+
+## Phase 4.2 closed — first stub tool with proposal contract
+
+Commits: `17844e3` (draft_email), `61d58b0` (registry), `39e225f` (proposals/ infra)
+
+### What landed
+- `claw/betty_claw/tools/__init__.py` — tool registry. Exposes `TOOLS` dict
+  and `get_tool(name)` accessor with diagnostic KeyError.
+- `claw/betty_claw/tools/draft_email.py` — stub tool. Validates arguments
+  strictly, writes proposal JSON atomically, returns
+  `ToolResult(status="proposed")`. Does NOT send.
+- `claw/proposals/` — runtime storage directory. Tracked via `.gitkeep`
+  and `README.md`; contents gitignored.
+
+### Verified live
+- Self-test PASS from cold invocation. Happy path + 4 validation failures
+  (missing key, extra key, wrong type, empty string) all behave per
+  contract.
+- Snapshot-diff assertion confirms "validate before UUID, validate before
+  disk" property: exactly 1 new file in proposals/ after 1 happy path + 4
+  validation failures.
+- `git check-ignore` confirms ignore-pattern correctness: wildcard catches
+  `.json` and `.tmp`; negations un-ignore `.gitkeep` and `README.md`.
+- Registry smoke test: `TOOLS.keys() == ['draft_email']`, `get_tool` returns
+  callable, `KeyError` diagnostic produces designed message.
+- Phase 4.2 incurred zero Anthropic API spend — first Judge call lands in
+  Phase 4.3. Day-zero baseline from Phase 4.1 stands at $0.000915.
+
+### Locked decisions (carry forward)
+- Proposal JSON shape includes `schema_version` (starts at 1). Bump when
+  Phase 4.3 adds verdict fields; do not silently change shape.
+- `ToolResult.payload = {"proposal_path": "<absolute>"}`. Absolute path,
+  not relative — the Judge may run from a different CWD than the actor.
+- Atomic write pattern: tmpfile + fsync + os.replace. Required (not
+  optional) for the actor-writes-then-Judge-reads seam in Phase 4.3.
+- Strict validation: reject unknown keys, reject non-string values, reject
+  empty strings. No silent coercion. Forward-compat for new fields like
+  `cc` is handled by bumping `schema_version` in the same commit that adds
+  the field.
+- Validation occurs BEFORE call_id generation and BEFORE any disk write.
+  The proposals directory answers "did this tool attempt to run?" from
+  filesystem state alone. Enforced by snapshot-diff in self-test.
+- Tool registry lives in `tools/__init__.py`, not `actor.py`. Eager imports.
+  Lazy loading deferred until measured evidence of slow imports.
+
+### Operator notes
+- Self-test command: `uv run python -m betty_claw.tools.draft_email`.
+- Python may emit `RuntimeWarning: 'betty_claw.tools.draft_email' found in
+  sys.modules after import of package 'betty_claw.tools'` — expected
+  because `tools/__init__.py` eagerly imports the module and `-m`
+  re-imports on invocation. Harmless. The PASS message is the source of
+  truth.
+- Stray `.tmp` files in `claw/proposals/` indicate a crashed tool process
+  mid-atomic-write. Safe to delete; the rename never happened so no
+  partial-state was visible to a Judge.
+
+### Incidents
+- None this phase.
+
+### Phase 4.3 opens with
+- `claw/betty_claw/judge.py` — Judge module. Reads proposal JSON, calls
+  Opus 4.7 via `anthropic_client`, returns `JudgeVerdict(approve|reject)`.
+- Spend-ledger persistence: where on disk, atomic writes, restart-safety.
+- Circuit-breaker logic: 3 rejections/turn (in-memory in Judge instance),
+  $5.00/day Anthropic spend cap (persisted in ledger).
+- `actor.py` modifications: dispatch through registry, route proposals
+  through Judge, handle approve/reject, write ToolResult.status.
+- Judge prompt: string constant in `judge.py`. Aware of the Stage 5
+  footer-auto-append commitment — do NOT reject proposals for missing
+  AI disclosure.
