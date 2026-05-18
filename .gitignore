@@ -224,3 +224,13 @@ docker/.env
 # Workspace migration backups
 etl/pyproject.toml.preworkspace
 etl/uv.lock.preworkspace
+
+# Betty runtime state
+# Proposals directory holds transient JSON proposal files written by tools
+# in claw/betty_claw/tools/. The directory itself is tracked (via .gitkeep
+# and README.md) so fresh clones have the directory, but its contents are
+# ignored. Option (c) pattern: ignore everything, explicitly allow the
+# two metadata files.
+claw/proposals/*
+!claw/proposals/.gitkeep
+!claw/proposals/README.md
