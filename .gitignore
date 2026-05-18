@@ -18,7 +18,6 @@ lib/
 lib64/
 parts/
 sdist/
-var/
 wheels/
 share/python-wheels/
 *.egg-info/
@@ -234,3 +233,8 @@ etl/uv.lock.preworkspace
 claw/proposals/*
 !claw/proposals/.gitkeep
 !claw/proposals/README.md
+
+# Phase 4.3: runtime mutable state
+var/*
+!var/README.md
+!var/.gitkeep
