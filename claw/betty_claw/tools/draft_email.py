@@ -44,6 +44,50 @@ from typing import Tuple
 
 from betty_claw.types import ToolCall, ToolResult
 
+
+# ---------------------------------------------------------------------------
+# Tool schema (Phase 4.3)
+# ---------------------------------------------------------------------------
+
+DRAFT_EMAIL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "draft_email",
+        "description": (
+            "Draft an email for the user to review before sending. Writes a "
+            "proposal JSON file to disk and returns a proposal_path; does NOT "
+            "send the email. The Judge evaluates the proposal before any "
+            "Stage 5+ send tool would execute it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Recipient email address.",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Subject line.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Email body in plain text.",
+                },
+            },
+            "required": ["to", "subject", "body"],
+            "additionalProperties": False,
+        },
+    },
+}
+"""OpenAI/Ollama function-calling schema for draft_email.
+
+Exposed to Qwen via the tool registry so the actor can pass schemas to
+Ollama. The required fields and shape match the strict validator in
+this module — schema and validator are intentionally consistent and
+must be updated together if the tool contract changes."""
+
+
 # Proposals directory. Resolved relative to this file so the path is stable
 # regardless of the CWD the actor runs from.
 #
