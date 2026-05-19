@@ -65,8 +65,8 @@ class JudgeVerdict:
 class SpendLedger:
     """On-disk shape of the daily Anthropic spend ledger.
 
-    Persisted as JSON at ~/code/betty/claw/spend-ledger.json. Read/write
-    logic lives in judge.py (Phase 4.3) — this is just the contract.
+    Persisted as JSON at ~/code/betty/var/spend_ledger.json. Read/write
+    logic lives in spend_ledger.py — this is just the contract.
 
     Per-turn rejection counting is transient state and lives in-memory in
     the Judge instance, NOT here. The ledger is for dollars only.
