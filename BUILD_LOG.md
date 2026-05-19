@@ -527,3 +527,308 @@ Commits: `17844e3` (draft_email), `61d58b0` (registry), `39e225f` (proposals/ in
 - Judge prompt: string constant in `judge.py`. Aware of the Stage 5
   footer-auto-append commitment — do NOT reject proposals for missing
   AI disclosure.
+
+## Phase 4.3 closed — Judge wired, actor inner loop, full safety stack
+
+Commits: `916f600` (atomic_io), `5c461f3` (var/ infra), `0b805d8` (spend_ledger), `f88c074` (Judge), `b160c6d` (OllamaClient tool-calling extension), `1f70bc0` (tool registry schema export), `3d09cf6` (actor.py inner loop)
+
+### What landed
+
+- `claw/betty_claw/atomic_io.py` — shared atomic JSON write utility. Factored
+  at the second use site (rule of three played correctly). tmpfile + fsync +
+  os.replace, with `except BaseException` cleanup to defend against
+  KeyboardInterrupt mid-write.
+- `var/` — new repo-root directory for runtime mutable state. README.md and
+  .gitkeep tracked; contents gitignored. Matches `claw/proposals/` pattern.
+- `claw/betty_claw/spend_ledger.py` — daily Anthropic spend ledger.
+  Persistent at `var/spend_ledger.json`. `load()` returns
+  `LedgerResult(status: ok|fresh|corrupt, ledger, corruption_reason)`.
+  `check()` is a pure function; `record()` is read-modify-write with no
+  caching across calls. Fail-loud on corruption.
+- `claw/betty_claw/judge.py` — the Judge. `Judge.before_tool_call()` consults
+  the ledger, estimates cost, calls Opus 4.7 via the Phase 4.1 client,
+  parses verdict, returns `JudgeVerdict`. `reset_turn()` zeros the in-memory
+  per-turn rejection counter. Lenient JSON parsing (strict first, regex
+  fallback for the first `{...}` block).
+- `claw/betty_claw/ollama_client.py` — extended for native tool-calling.
+  `ChatMessage` supports `tool_calls` and `role='tool'`. `ChatResponse`
+  surfaces parsed `tool_calls`. `chat()` accepts optional `tools=` schemas
+  passthrough. Stage 3 callers that omit the new parameters get identical
+  behavior.
+- `claw/betty_claw/tools/__init__.py` — extended with `ToolEntry` dataclass
+  pairing callable and schema. New `get_ollama_tools_schema()` returns
+  schemas in sorted order for KV cache stability. Phase 4.2's `TOOLS`
+  shape changed; verified no consumers existed before refactoring.
+- `claw/betty_claw/tools/__main__.py` — new file. Required for
+  `python -m betty_claw.tools` to execute (packages need `__main__.py`
+  for `-m`, unlike modules).
+- `claw/betty_claw/tools/draft_email.py` — `DRAFT_EMAIL_SCHEMA` module
+  constant added. Schema's required-fields and types mirror the existing
+  strict validator. Tool body unchanged.
+- `claw/betty_claw/actor.py` — Stage 3 actor extended with the inner loop.
+  `ActorTurn` gains `outcome`, `proposal_path`, `judge_verdicts`,
+  `iterations` fields with defaults. `actor_turn()` accepts optional
+  `judge: Judge | None`. When None, Stage 3 single-call behavior preserved
+  exactly. When supplied, the bounded inner loop activates.
+
+### Verified live
+
+All seven modules have self-tests. The substantive ones:
+
+- **judge.py**: 6 scenarios PASSED. Real-API verdicts: faithful email
+  approved ($0.0203); phishing email rejected with concrete reasoning
+  ($0.0275); 2-rejection breaker trips and 3rd call short-circuits at $0;
+  `reset_turn()` clears the counter; near-cap ledger refuses without API
+  hit; corrupt ledger refuses without API hit. Total Judge self-test cost:
+  $0.1157 across 5 Anthropic calls.
+- **ollama_client.py**: 3 scenarios PASSED against local Qwen 3 14B.
+  Stage 3 baseline preserved (text response, zero tool_calls). Tool-calling
+  produces parseable `tool_calls` with correct name and arguments.
+  `role='tool'` rejection feedback accepted by Ollama; Qwen retried with
+  corrected tool call.
+- **actor.py**: 3 scenarios PASSED end-to-end. Scenario A — Stage 3 text
+  path (no Judge, retrieval ran, outcome='text'). Scenario B — approve
+  path (real Judge + real Qwen, draft_email proposal written to disk,
+  outcome='tool_approved' at $0.0195). Scenario C — reject-loop + breaker
+  trip with MockJudge (3 rejections, third has cost_usd == 0.0,
+  outcome='breaker_tripped', iterations=3, structural cost-zero detection
+  worked under adversarial Judge).
+
+Total Phase 4.3 self-test Anthropic spend: roughly $0.14.
+
+### Day-zero cost baselines (carry forward)
+
+- Phase 4.1: bare ping = **$0.000915** (31 input + 6 output tokens).
+- Phase 4.3: full Judge call = **~$0.023** average over the Judge
+  self-test's 5 paid calls ($0.0203, $0.0275, $0.0243, $0.0231, $0.0205).
+  Implied headroom at $5.00/day cap: roughly 215 Judge calls.
+
+### Safety properties — all five Stage 4 properties satisfied
+
+- **#1 No tool executes without Judge approval** (satisfied Phase 4.2; tools
+  return `status='proposed'` only). Phase 4.3 confirms: actor only returns
+  `outcome='tool_approved'` after `verdict.decision == 'approve'`.
+- **#2 Daily spend cap enforced before API call.** Pre-call conservative
+  estimate ($0.0375 = max_tokens 500 * output rate $75/Mtok) gated against
+  `spend_ledger.check()`. Verified live in Scenario 5 of judge self-test:
+  near-cap ledger refused without API hit, `cost=$0.0`.
+- **#3 Repeated rejections halt the loop.** In-memory counter on Judge
+  instance; `reset_turn()` at turn boundary; counter increments on
+  substantive rejects AND on API/parse failures. Verified in Scenario 3
+  of judge self-test (real Opus rejections) and Scenario C of actor
+  self-test (MockJudge adversarial rejections, structural `cost_usd == 0.0`
+  detection).
+- **#4 Spend ledger persists across restarts.** Atomic writes via
+  atomic_io.atomic_write_json; corruption fail-loud via `LedgerResult.status`;
+  internal-consistency b2 validator (`cumulative_cost_usd == sum(entries)`
+  within 1e-9 tolerance) catches drift at load. Verified across 10
+  scenarios in spend_ledger self-test.
+- **#5 Failed Anthropic calls fail safe.** `AnthropicAPIError`,
+  `AnthropicResponseError`, and malformed verdict JSON all route through
+  Judge's `_reject()` with diagnostic reasoning. Counter increments. No
+  tool executes on Judge failure. Verified by composition (Judge calls the
+  Phase 4.1 client which raises these exceptions; Judge's `_reject()` path
+  is exercised by the cap-refused and corrupt-ledger scenarios).
+
+### Locked decisions (carry forward)
+
+- **Day boundary for spend cap**: local Toronto midnight via
+  `ZoneInfo("America/Toronto")`. DST transitions produce one 23-hour and
+  one 25-hour day per year. Accepted as known property, not incidents.
+- **Spend ledger location**: `var/spend_ledger.json`, NOT
+  `claw/spend-ledger.json`. The types.py docstring's path reference is
+  stale; left unmodified to preserve Phase 4.1 closure seal (see Deferred
+  cleanup below).
+- **Internal-consistency validator pattern**: option (b2) from design
+  discussion — validate in `spend_ledger.load()`, not in types.py. Same
+  discipline rationale as #2 above. Drift between `cumulative_cost_usd`
+  and `sum(entries)` routes to `status='corrupt'`.
+- **JudgeVerdict.call_id = ToolCall.call_id** (the tool's UUID4), not the
+  Anthropic msg_id. The Phase 4.1 `AnthropicResponse` does not surface
+  msg_id; reaching back to add it would violate the Phase 4.1 seal.
+  Anthropic-bill cross-reference is available via timestamps on ledger
+  entries.
+- **Cost estimation**: conservative worst-case `max_tokens * output_rate
+  = $0.0375/call`. Input token cost is recorded post-call from actual
+  usage, never pre-estimated. Pre-check is a gating estimate, not an
+  accounting figure.
+- **API failures count toward the rejection breaker.** A Judge that's
+  failing repeatedly is itself halt-worthy.
+- **Verdict parsing is lenient** (strict `json.loads` first, regex fallback
+  for first `{...}` block). The Judge system prompt instructs Opus to
+  emit pure JSON, but enforcement is belt-and-braces.
+- **Tool dispatch translates wire-shape ToolCall to types.ToolCall** in
+  the actor. Two `ToolCall` classes exist by design: one in
+  `ollama_client.py` (what Ollama emits) and one in `types.py` (what the
+  Judge sees, carrying UUID4 call_id). The actor is the translation
+  boundary.
+- **Terminal-vs-substantive rejection is STRUCTURAL**: `verdict.cost_usd
+  == 0.0` distinguishes no-API short-circuit (breaker/cap/corrupt, halt)
+  from substantive reject (cost > 0, feed back and loop). String matching
+  on `verdict.reasoning` is used only for outcome label classification,
+  never for control flow.
+- **Inner loop bounded by `max_iterations = rejection_limit + 1`** as
+  defense in depth. In practice the Judge's breaker trips first.
+
+### Incidents
+
+**Discipline preserved: types.py stdlib shadow surfaced under direct-script execution.**
+While developing atomic_io.py, the run plan deviated from the documented
+`uv run python -m betty_claw.<module>` invocation and used direct-script
+execution (`uv run python claw/betty_claw/atomic_io.py`). This put
+`claw/betty_claw/` first on `sys.path`, causing stdlib `json` -> `re` ->
+`enum`'s transitive `import types` to resolve to our Phase 4.1
+`claw/betty_claw/types.py` instead of stdlib `types`. ImportError fired
+on circular import.
+
+Three fix options surfaced: (1) rename `types.py` to `contracts.py`
+(structural fix, touches Phase 4.1 closed code), (2) standardize on `-m`
+invocation (workaround, preserves Phase 4.1 seal), (3) move self-tests to
+a separate tests/ directory (architectural change out of scope).
+
+Initial assistant lean was Option 1, framed as a "Phase 4.1 bug fix."
+User pushed back: framing as a bug fix is plausible but weakens the
+phase-closure discipline; once "reach back if framed as bug fix" is
+accepted, the seal on closed phases becomes negotiable. Option 2 was
+not actually a change — it was already the documented invocation
+pattern. The deviation was the run plan, not the codebase.
+
+**Resolution**: Option 2. Rename deferred. Cost of leaving it: zero
+under documented usage. Cost of renaming: reopen Phase 4.1, update every
+importer (anthropic_client, draft_email, tools/__init__.py), full
+re-verification pass. Cost-benefit favored deferring.
+
+**Meta-lesson**: locked phase boundaries are the source of truth for
+what may and may not be reopened. Framing a Phase 4.3 surface concern
+as a Phase 4.1 bug fix is rhetorical drift, not a discipline.
+
+**Known latent footgun: stdlib name shadow.**
+`claw/betty_claw/types.py` shadows the Python stdlib `types` module
+under direct-script execution. Documented invocation pattern
+(`uv run python -m betty_claw.<module>` from workspace root) dodges it.
+Anyone running scripts directly will hit ImportError. Fix: use `-m` from
+workspace root. Structural fix (rename to `contracts.py`) deferred to a
+future cleanup phase that would also handle the related deferred items
+below.
+
+**.gitignore var/ collision.**
+The Phase 4.3 var/ runtime directory commit landed broken on first
+attempt because the existing `.gitignore` had `var/` in the standard
+Python `Distribution / packaging` block (template artifact, irrelevant
+to this project). The new `var/* + !var/README.md + !var/.gitkeep`
+allow-list at the bottom of `.gitignore` was silently overridden by the
+upper-block `var/`. Git showed "The following paths are ignored" and
+the commit landed with only 5 insertions (the new gitignore lines) and
+NO `var/README.md` or `var/.gitkeep`.
+
+**Resolution**: `git reset --soft HEAD~1` to undo the bad commit while
+keeping changes staged; targeted sed surgery to remove the upper-block
+`var/` line; re-commit with both `.gitignore` edits and the var/ files.
+Local-only history rewrite, no force-push needed (commit hadn't been
+pushed).
+
+**Meta-lesson**: read `git commit` output carefully. The
+"file changed, 5 insertions" line was the tell; 5 insertions for what
+should have been a multi-file infrastructure change was an obvious red
+flag that I caught only on the verification step.
+
+**ToolResult.call_id contract mistake.**
+In the first draft of actor.py, the code read
+`call_id=tool_result.payload["call_id"]`. Self-test Scenario B failed
+with `KeyError: 'call_id'`. Root cause: `ToolResult.call_id` is a
+top-level field (Phase 4.1 contract), not inside `payload`. `payload`
+contains only `{"proposal_path": ...}`. I'd conflated where each piece
+of information lives.
+
+**Resolution**: one-line sed fix. Same class of bug as the
+`cumulative_cost_usd` field assumption that the b2 discussion caught
+earlier in the phase.
+
+**Meta-lesson**: the discipline of `grep -B 2 -A 15 "class X"` before
+writing code that touches a contract is non-negotiable. It catches
+this exact class of bug. I did it for `SpendLedger`, `JudgeVerdict`,
+`ToolCall`, and `AnthropicClient` — but not for `ToolResult`, and it
+bit me. Always grep.
+
+**External review caught coverage gap (Scenario C).**
+Initial actor.py self-test design proposed two scenarios: approve path
+and text path, with the reject-loop's correctness verified "by
+composition" (Judge self-test scenario 3 exercises the breaker;
+OllamaClient self-test scenario 3 exercises role='tool' feedback).
+Gemini reviewed and pushed back: the inner loop's `while`-bound on
+rejections is the load-bearing financial safety mechanism, and a bug
+there could infinite-loop and burn the API budget. Composition coverage
+isn't sufficient when the gap is the integration glue itself.
+
+**Resolution**: added MockJudge (duck-typed, not a Judge subclass) that
+mirrors the real Judge's two rejection modes (substantive: cost > 0,
+short-circuit: cost == 0). Scenario C asserts the actor halts at
+`outcome='breaker_tripped'` after exactly 3 iterations with structural
+cost_usd == 0.0 detection on the third verdict.
+
+**Meta-lesson**: composition coverage of a load-bearing safety mechanism
+is a rationalization to leave it untested, not a reason. When external
+review catches this, accept the pushback.
+
+### Deferred cleanup (carry forward to a future cleanup phase)
+
+These are known imperfections that we explicitly chose not to fix in
+Phase 4.3 to preserve the Phase 4.1 and Phase 4.2 closure seals. A
+future cleanup phase should address them together since they're all
+the same category of debt.
+
+- Rename `claw/betty_claw/types.py` to `contracts.py` (or similar) to
+  eliminate the stdlib shadow.
+- Update the stale docstring path reference in `types.py`'s
+  `SpendLedger` (`~/code/betty/claw/spend-ledger.json` -> actual
+  `~/code/betty/var/spend_ledger.json`).
+- Migrate `claw/betty_claw/tools/draft_email.py`'s inline atomic write
+  to use `claw/betty_claw/atomic_io.py`'s shared utility. Phase 4.3
+  introduced atomic_io.py as the second use site; the cleanup phase
+  becomes the third-site migration consolidating both prior sites.
+- Consider whether the `tools/` package's executable `__main__.py`
+  pattern should be applied retroactively to other packages, or whether
+  it stays unique to the registry.
+
+### Operator notes
+
+- Run all self-tests via `uv run python -m betty_claw.<module>` from
+  workspace root. Direct-script execution hits the types.py shadow.
+- Self-test order if running the full suite in sequence: atomic_io,
+  spend_ledger, anthropic_client (Phase 4.1), tools, ollama_client,
+  draft_email, judge, actor. Each is independent and writes to
+  `/tmp/betty_*_selftest` directories that are cleaned up on success.
+- `var/spend_ledger.json` accumulates real spend data across sessions.
+  To reset: `rm ~/code/betty/var/spend_ledger.json`. Next Judge call
+  will treat the missing file as `fresh` and start a new zero-cost
+  ledger for the current day.
+- A corrupt ledger blocks Judge operation by design (Property #5
+  fail-safe). To recover: delete the file and the Judge resumes on
+  the next call.
+- `claw/proposals/*.json` accumulates from approved tool calls.
+  Phase 4.3 doesn't yet have proposal cleanup; future operator-facing
+  review UI (Stage 5+) will handle this. Manual `rm` is safe.
+
+### Phase 4.4 opens with
+
+Phase 4.4 has not been scoped at kickoff time. Candidate work surfaces
+include:
+
+- **Send tool with AI-disclosure footer enforcement** (the Stage 5
+  Architectural Commitment). Replaces `draft_email` proposal-only
+  behavior with actual SMTP send, footer auto-appended at send time,
+  not bypassable from the actor surface.
+- **Operator review UI**: surface pending proposals at
+  `claw/proposals/` for human approval before execution. The Phase 4.3
+  approve verdict from Opus is necessary but not sufficient — Peter is
+  the final reviewer for any real-world action.
+- **Cleanup phase**: address the deferred items listed above.
+  Recommended before Phase 4.4 work that would add new tools or expand
+  the registry, because new tools would inherit the types.py shadow
+  and the second inline-atomic-write site is now the only barrier to
+  three-site migration becoming four-site.
+
+The kickoff for Phase 4.4 (or Phase 5.0, depending on scoping) should
+include a fresh architectural review of where the Stage 5 send tool
+slots in relative to the operator review UI — they may be the same
+work or sequential phases.
