@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
 
-from betty_claw.types import ToolCall, ToolResult
+from betty_claw.contracts import ToolCall, ToolResult
 
 
 # ---------------------------------------------------------------------------

@@ -48,10 +48,10 @@ back into the conversation history."""
 class ToolCall:
     """One tool invocation emitted by the model.
 
-    Distinct from betty_claw.types.ToolCall (which carries a UUID4
+    Distinct from betty_claw.contracts.ToolCall (which carries a UUID4
     call_id and is what the Judge sees). This dataclass is the wire
     shape coming out of Ollama; the actor translates these into
-    betty_claw.types.ToolCall objects by minting a call_id and
+    betty_claw.contracts.ToolCall objects by minting a call_id and
     correlating with the tool registry.
     """
     name: str

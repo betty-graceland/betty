@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from betty_claw.tools.draft_email import DRAFT_EMAIL_SCHEMA, draft_email
-from betty_claw.types import ToolResult
+from betty_claw.contracts import ToolResult
 
 
 @dataclass(frozen=True)

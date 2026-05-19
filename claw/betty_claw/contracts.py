@@ -1,5 +1,5 @@
 """
-claw/betty_claw/types.py
+claw/betty_claw/contracts.py
 
 Stage 4 data contracts. Frozen dataclasses for immutability across the
 Qwen -> Judge -> Tool boundary. Defining these before transport (httpx

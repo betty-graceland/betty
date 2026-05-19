@@ -32,7 +32,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from betty_claw.atomic_io import atomic_write_json
-from betty_claw.types import SpendLedger
+from betty_claw.contracts import SpendLedger
 
 
 # Module-level constants

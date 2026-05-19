@@ -66,7 +66,7 @@ from betty_claw.anthropic_client import (
     AnthropicResponse,
     AnthropicResponseError,
 )
-from betty_claw.types import JudgeVerdict, ToolCall
+from betty_claw.contracts import JudgeVerdict, ToolCall
 
 
 # Module-level constants

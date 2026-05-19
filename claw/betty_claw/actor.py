@@ -72,7 +72,7 @@ from betty_claw.ollama_client import (
     OllamaClient,
 )
 from betty_claw.tools import get_ollama_tools_schema, get_tool
-from betty_claw.types import JudgeVerdict, ToolCall, ToolResult
+from betty_claw.contracts import JudgeVerdict, ToolCall, ToolResult
 
 
 # ---------- Configuration ----------
