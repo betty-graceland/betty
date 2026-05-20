@@ -832,3 +832,201 @@ The kickoff for Phase 4.4 (or Phase 5.0, depending on scoping) should
 include a fresh architectural review of where the Stage 5 send tool
 slots in relative to the operator review UI — they may be the same
 work or sequential phases.
+
+## Cleanup Phase closed — Phase 4.3 deferred items paid down
+
+Commits: `86ca1af` (SpendLedger docstring corrections), `17bf70b` (types.py → contracts.py rename), `43ae4a3` (draft_email atomic_io migration)
+
+Phase 4.3's closure entry recommended a cleanup phase before Phase 4.4
+work that would add new tools or expand the registry, because new tools
+would inherit the `types.py` stdlib shadow and the second inline-atomic-
+write site would become the only barrier to three-site migration becoming
+four-site. The Cleanup Phase honors that recommendation. All four
+deferred items from Phase 4.3 are resolved.
+
+### What landed
+
+- `claw/betty_claw/contracts.py` — renamed from `types.py`. The new name
+  reflects what the file always was: data contracts crossing safety
+  boundaries between actor, Judge, tools, and ledger. The file's own
+  module docstring already called these "Stage 4 data contracts" (line
+  4). "Types" was a misnomer — the file does not define types in the
+  Python sense (TypeVars, NewTypes, generic protocols), it defines
+  frozen dataclasses for cross-boundary contracts. Direct-script
+  execution (`uv run python claw/betty_claw/contracts.py`) now exits
+  cleanly with no output, structurally eliminating the stdlib shadow.
+  All six importers updated atomically in the same commit; two docstring
+  references in `ollama_client.py` (citing `betty_claw.types.ToolCall`
+  in prose explaining the distinction between Ollama's wire-shape
+  ToolCall and the contract ToolCall) also updated.
+- `claw/betty_claw/contracts.py` docstring (SpendLedger class) — two
+  stale claims corrected in a single hunk: the persistence path
+  (`claw/spend-ledger.json` → `var/spend_ledger.json`, stale since the
+  Phase 4.3 `5c461f3` var/ infrastructure commit) and the read/write
+  logic location ("lives in judge.py" → "lives in spend_ledger.py",
+  stale since the Phase 4.3 `0b805d8` extraction). Both staleness
+  claims were Phase 4.3 artifacts in the same two-line block; fixing
+  both under the same commit was defensible because the second was
+  found while reading the docstring we were already editing — not a
+  rationalized reach-back, just refusing to leave a known-wrong line
+  in a docstring we'd just touched.
+- `claw/betty_claw/tools/draft_email.py` — inline `_write_proposal_atomic`
+  helper deleted (19 lines), replaced with a call to the shared
+  `betty_claw.atomic_io.atomic_write_json` utility plus a two-line
+  comment preserving the local rationale ("the Judge must never observe
+  a partial-write state while reading this proposal file"). `atomic_io`
+  now serves three sites: `spend_ledger`, `draft_email`, and any future
+  tool that needs JSON written atomically. `import os` removed (became
+  dead after the function deletion); `import json` retained (still used
+  by the self-test for round-trip validation).
+- `__main__.py` audit performed. Three packages discovered in the
+  codebase (the kickoff predicted one): `betty_claw/` top-level,
+  `betty_claw/tools/`, and `betty_claw/betty_os/`. Audit rule: a package
+  needs `__main__.py` if it has a `_self_test()` function. Only `tools/`
+  qualifies, and Phase 4.3 already added its `__main__.py`. `betty_os/`
+  is a documentation-only namespace (`AGENTS.md`, `MEMORY.md`, `USER.md`
+  plus an empty `__init__.py`) and doesn't qualify. No code change
+  required.
+
+### Verified live
+
+All eight self-tests passed after every commit in the verification gate
+(`atomic_io`, `spend_ledger`, `anthropic_client`, `ollama_client`,
+`tools`, `tools.draft_email`, `judge`, `actor`). Baseline established
+pre-rename to confirm the boundary state. Total Anthropic API spend for
+the phase: approximately $0.39 across baseline (~$0.13) plus Commit 2
+gate (~$0.13) plus Commit 3 gate (~$0.13).
+
+Stdlib shadow elimination verified by direct-script execution after
+Commit 2:
+$ uv run python claw/betty_claw/contracts.py
+$ echo "exit=$?"
+exit=0
+
+This was impossible with `types.py` because the filename itself
+shadowed the stdlib `types` module on direct execution. The exit-0
+with no `ImportError` is the structural proof.
+
+### Locked decisions (carry forward)
+
+- The file is named `contracts.py`. Not `schemas.py`, not `models.py`,
+  not `dataclasses_.py`. The file defines data contracts crossing
+  safety boundaries.
+- Phase 4.1, 4.2, and 4.3 BUILD_LOG entries continue to reference
+  `types.py` because that is what existed at the time. Faithful
+  history wins over retroactive hygiene. The Cleanup Phase BUILD_LOG
+  entry (this entry) is the forward-looking source of truth for the
+  module name from this commit onward. The exception was `pyproject.toml`
+  and other non-historical config — none contained references to
+  the old name, so nothing needed updating.
+- `atomic_io.atomic_write_json` is the canonical atomic-JSON-write
+  utility. New tools that need this property import it from there.
+  Inline reimplementations are a code smell.
+
+### Incidents
+
+**Recurring pattern: stale `__pycache__` after file-structure changes.**
+
+Commit 2 (rename) and Commit 3 (function deletion) both produced
+transient self-test failures on first run that were resolved by
+clearing `__pycache__`. The pattern:
+
+- After Commit 2: actor Scenario C failed with `outcome=text,
+  verdicts=2` instead of `outcome=breaker_tripped, verdicts=3`. The
+  load-bearing financial circuit breaker appeared broken. Clearing
+  pyc resolved it.
+- After Commit 3: actor Scenario B failed with `iterations=2,
+  verdicts=2` instead of `1, 1`. The Judge reasoning on the logged
+  verdict named a fabricated signature block — which initially looked
+  like Qwen non-determinism but couldn't be, because pyc state has
+  zero influence on Ollama generation, and clearing pyc fixed it.
+
+Both failures shared the same diagnostic shape: not an `ImportError`
+(which would have been loud), but quieter inconsistencies in cross-
+boundary behavior. The mechanism by which stale bytecode referencing
+deleted code paths produced these specific symptoms is not fully
+understood, but the empirical pattern is unambiguous: any commit
+that renames a file or removes a top-level definition can leave
+orphaned `.pyc` files that produce flaky, mechanism-unclear test
+failures.
+
+**Meta-lesson**: clear pyc *before* the verification gate on any
+commit that changes file structure or removes top-level definitions,
+not after a failure. Standard recipe:
+find claw -name pycache -type d -exec rm -rf {} +
+find claw -name "*.pyc" -delete
+
+**Assistant diagnostic miss on the Commit 3 failure.**
+
+When Commit 3's actor Scenario B failed, the assistant initially
+diagnosed it as Qwen non-determinism — reasoning from the Judge's
+verdict content (real text about a signature block) without
+questioning whether the upstream stale-pyc hypothesis applied here
+too. The user ran the pyc-clear, the test passed, and the
+non-determinism story collapsed because pyc cache cannot influence
+Ollama sampling. The honest accounting: Commit 2's pyc footgun
+made the assistant pattern-match to "pyc issue" on first sight; one
+commit later, after constructing a plausible story for why this
+*specific* failure was different, the assistant got it wrong. The
+discipline takeaway is to treat "is this also stale pyc?" as the
+first hypothesis for any post-file-structure-change test failure
+in this phase, not the last.
+
+**Kickoff prediction wrong on package count.**
+
+The kickoff document predicted one package (`tools/`) in the codebase
+and the `__main__.py` audit therefore predicted no-op. The audit
+revealed three packages. The conclusion was still no-op because only
+`tools/` has a `_self_test()`, but the prediction was directionally
+correct on the outcome and wrong on the premise. Worth logging
+because the same class of prediction — "I know what the codebase
+looks like, the audit will find X" — could be wrong on other audits
+where the conclusion happens to be more consequential. Run the grep,
+trust the grep.
+
+### Deferred items resolved
+
+The four items from Phase 4.3's "Deferred cleanup (carry forward to a
+future cleanup phase)" section:
+
+1. **Rename `types.py` to eliminate the stdlib shadow** → resolved in
+   commit `17bf70b`. Renamed to `contracts.py`, all six importers and
+   two `ollama_client.py` docstring references updated atomically.
+2. **Update stale SpendLedger docstring path** → resolved in commit
+   `86ca1af`. Both the path and an adjacent stale "read/write logic
+   lives in" claim corrected in the same hunk.
+3. **Migrate `draft_email.py` to `atomic_io`** → resolved in commit
+   `43ae4a3`. Inline helper deleted, shared utility imported, three-
+   site consolidation complete.
+4. **Audit whether `__main__.py` pattern applies retroactively to other
+   packages** → audit performed (no code commit). Three packages
+   discovered, only `tools/` qualifies, no action required. Recorded
+   above in "What landed."
+
+### Operator notes
+
+Carried forward from Phase 4.3 unchanged, with one addition:
+
+- Direct-script execution is now safe. The Phase 4.3 operator note
+  warning ("Direct-script execution hits the types.py shadow") is
+  obsolete from commit `17bf70b` onward. `uv run python
+  claw/betty_claw/contracts.py` exits 0 with no output, by construction.
+  The `-m` invocation pattern remains recommended for self-test
+  consistency, but is no longer load-bearing for shadow avoidance.
+
+### Phase 4.4 opens with
+
+Same candidate work surfaces as Phase 4.3's closure recommended,
+minus the cleanup phase recommendation (now done):
+
+- **Send tool with AI-disclosure footer enforcement** (the Stage 5
+  Architectural Commitment).
+- **Operator review UI** for `claw/proposals/`.
+
+The kickoff for Phase 4.4 (or Phase 5.0, depending on scoping) should
+include a fresh architectural review of where the Stage 5 send tool
+slots in relative to the operator review UI — they may be the same
+work or sequential phases. The Cleanup Phase has reduced the structural
+debt that would have made either of those phases noisier; the choice
+between them is now substantive scope work, not a question of "should
+we clean up first."
