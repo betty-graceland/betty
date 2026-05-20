@@ -36,12 +36,12 @@ field changes), bump the version and handle migration in the Judge reader.
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
 
+from betty_claw.atomic_io import atomic_write_json
 from betty_claw.contracts import ToolCall, ToolResult
 
 
@@ -153,27 +153,6 @@ def _validate_arguments(args: dict) -> Tuple[str, str, str]:
     return args["to"], args["subject"], args["body"]
 
 
-def _write_proposal_atomic(path: Path, payload: dict) -> None:
-    """
-    Write proposal JSON atomically: write to <path>.tmp, fsync, then
-    os.replace.
-
-    os.replace is atomic on POSIX (and on Windows for same-filesystem
-    renames). fsync before rename guards against the rare crash window
-    where the rename completes but the data hasn't hit the platter,
-    leaving a file that exists but is empty.
-
-    This guarantees the Judge in Phase 4.3 cannot observe a partial-write
-    state.
-    """
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
-
-
 def draft_email(args: dict) -> ToolResult:
     """
     Propose an email send. Does NOT send.
@@ -208,7 +187,9 @@ def draft_email(args: dict) -> ToolResult:
         },
     }
 
-    _write_proposal_atomic(proposal_path, payload)
+    # Atomic write — the Judge must never observe a partial-write state
+    # while reading this proposal file.
+    atomic_write_json(proposal_path, payload)
 
     return ToolResult(
         call_id=call_id,
