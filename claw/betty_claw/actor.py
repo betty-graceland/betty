@@ -269,18 +269,29 @@ def _classify_short_circuit(reasoning: str) -> ActorOutcome:
 
 def _synthesize_approval_response(
     wire_call_name: str,
-    proposal_path: str,
+    summary: str | None = None,
+    proposal_path: str | None = None,
 ) -> str:
     """User-facing message when the Judge approves a tool call.
 
-    Phase 4.3 writes proposals but does not execute them. Stage 5+
-    will add a send step; for now we surface the proposal path so
-    Peter can inspect what Betty would have done.
+    Phase 4.3 introduced this for `draft_email`'s proposal-file pattern:
+    the tool writes a proposal JSON to disk and the response surfaces
+    the path. Phase 4.6 generalized: most new tools (emdash_*, write_file,
+    git_*) don't write proposals — they execute their action and put a
+    human-readable `summary` string in the result payload.
+
+    The response prefers `summary` if present, falls back to the
+    Phase 4.3 proposal-path pattern, then to a generic "completed"
+    message. Tools that surface neither still get a usable string.
     """
-    return (
-        f"I prepared a {wire_call_name} proposal for your review. "
-        f"The full details are at: {proposal_path}"
-    )
+    if summary:
+        return f"{wire_call_name}: {summary}"
+    if proposal_path:
+        return (
+            f"I prepared a {wire_call_name} proposal for your review. "
+            f"The full details are at: {proposal_path}"
+        )
+    return f"{wire_call_name} completed."
 
 
 def _synthesize_read_only_response(
@@ -493,7 +504,12 @@ def actor_turn(
 
             # Terminal case B: Judge approved.
             if verdict.decision == "approve":
-                proposal_path = tool_result.payload["proposal_path"]
+                # Phase 4.6: not every tool returns a proposal_path. draft_email
+                # does (Phase 4.3 proposal-file pattern); the new emdash_* /
+                # write_file / git_* tools surface a `summary` string instead.
+                # Extract both defensively; response synthesis prefers summary.
+                proposal_path = tool_result.payload.get("proposal_path")
+                summary = tool_result.payload.get("summary")
                 judge_decisions.write_verdict(
                     envelope=envelope,
                     verdict=verdict,
@@ -503,7 +519,9 @@ def actor_turn(
                 return ActorTurn(
                     user_message=user_message,
                     response=_synthesize_approval_response(
-                        wire_call.name, proposal_path
+                        wire_call.name,
+                        summary=summary,
+                        proposal_path=proposal_path,
                     ),
                     hits=hits,
                     chat_response=chat_response,
