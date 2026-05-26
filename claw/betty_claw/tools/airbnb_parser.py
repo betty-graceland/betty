@@ -82,7 +82,11 @@ from typing import Any
 from betty_claw.contracts import ToolResult
 from betty_claw.tools.emdash_reads import _assert_dict_keys, _assert_str
 from betty_claw.tools.emdash_writes import _validate_data_for_collection
-from betty_claw.tools.filesystem import BETTY_DOCS_DIR, _validate_path_under
+from betty_claw.tools.filesystem import (
+    BETTY_DOCS_DIR,
+    BETTY_RESEARCH_DIR,
+    _validate_path_under,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +463,15 @@ def parse_airbnb_dossier(args: dict) -> ToolResult:
     )
     _assert_str(args["path"], "path", "parse_airbnb_dossier")
 
-    # Path must live under BETTY_DOCS_DIR (read-only root for the
-    # research dossiers). Defense in depth on top of file existence.
-    path = _validate_path_under(args["path"], (BETTY_DOCS_DIR,))
+    # Path must live under one of the read-only roots. Dossiers are
+    # typically in BETTY_RESEARCH_DIR/01-source-data/research/
+    # airbnb-listings/ but we accept any read-allowed location so the
+    # tool works against both the local research tree and any future
+    # Drive-synced location.
+    path = _validate_path_under(
+        args["path"],
+        (BETTY_DOCS_DIR, BETTY_RESEARCH_DIR),
+    )
     if not path.exists():
         raise ValueError(f"Dossier file does not exist: {path}")
     if not path.is_file():

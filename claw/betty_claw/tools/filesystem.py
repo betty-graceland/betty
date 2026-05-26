@@ -10,15 +10,24 @@ regardless of what Qwen emits.
 
 Allowed roots (via env at module load):
 
-  BETTY_SITE_DIR  — read + list + write. The Astro project working tree
-                    (default: ~/Projects/emdash/travelpec-site). git_*
-                    tools also operate on this directory.
+  BETTY_SITE_DIR     — read + list + write. The Astro project working tree
+                       (default: ~/Projects/emdash/travelpec-site). git_*
+                       tools also operate on this directory.
 
-  BETTY_DOCS_DIR  — read + list only (NOT writable from these tools).
-                    Site docs/voice/research dossiers on Google Drive
-                    (default: ~/My Drive/Betty/emdash-sites/travelpec.com-v3).
+  BETTY_DOCS_DIR     — read + list only (NOT writable from these tools).
+                       Drive-synced metadata: kickoff brief, voice doc,
+                       UI-polish notes, architecture decisions
+                       (default: ~/My Drive/Betty/emdash-sites/travelpec.com-v3).
 
-Both are resolved (symlinks followed) at module load. A path that doesn't
+  BETTY_RESEARCH_DIR — read + list only. Local-disk copy of the project's
+                       source data and research dossiers (the 35 Airbnb
+                       scrapes, the article research files). NOT Drive-
+                       synced — Phase 4.6.1 confirmed the SOP folder
+                       01-source-data/ lives locally, not in the Drive
+                       mirror that holds the metadata folders.
+                       (default: ~/travelpec-com).
+
+All three are resolved (symlinks followed) at module load. A path that doesn't
 resolve under one of these roots raises ValueError at validate-time, before
 any file I/O.
 
@@ -66,7 +75,18 @@ BETTY_DOCS_DIR: Path = _resolve_root(
     "~/My Drive/Betty/emdash-sites/travelpec.com-v3",
 )
 
-READ_ROOTS: tuple[Path, ...] = (BETTY_SITE_DIR, BETTY_DOCS_DIR)
+# Phase 4.6.1 finding: research dossiers live in a separate local root
+# from the Drive-synced docs/metadata. Adding as a third readable root
+# rather than expanding BETTY_DOCS_DIR — they're genuinely different
+# folders with different sync mechanics (Drive vs local).
+BETTY_RESEARCH_DIR: Path = _resolve_root(
+    "BETTY_RESEARCH_DIR",
+    "~/travelpec-com",
+)
+
+READ_ROOTS: tuple[Path, ...] = (
+    BETTY_SITE_DIR, BETTY_DOCS_DIR, BETTY_RESEARCH_DIR,
+)
 WRITE_ROOTS: tuple[Path, ...] = (BETTY_SITE_DIR,)
 
 
