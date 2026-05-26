@@ -238,3 +238,7 @@ claw/proposals/*
 var/*
 !var/README.md
 !var/.gitkeep
+
+# macOS Finder artifacts
+.DS_Store
+**/.DS_Store

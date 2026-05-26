@@ -330,11 +330,21 @@ def emdash_get_content(args: dict) -> ToolResult:
         "content_get",
         {"collection": args["collection"], "id": args["id"]},
     )
+    # Robust title extraction across possible response shapes:
+    # - {"data": {"title": "..."}, ...}  (content_list-style item)
+    # - {"title": "...", ...}            (flat field-promotion shape)
+    # - {"item": {"data": {"title"...}}} (wrapper variant)
     title = "?"
     if isinstance(data, dict):
         item_data = data.get("data")
-        if isinstance(item_data, dict):
-            title = item_data.get("title", "?")
+        if isinstance(item_data, dict) and "title" in item_data:
+            title = item_data["title"]
+        elif "title" in data:
+            title = data["title"]
+        elif isinstance(data.get("item"), dict):
+            inner = data["item"].get("data")
+            if isinstance(inner, dict) and "title" in inner:
+                title = inner["title"]
     return _wrap_result(
         "emdash_get_content",
         data,
@@ -369,8 +379,16 @@ def emdash_list_taxonomies(args: dict) -> ToolResult:
     _assert_dict_keys(args, required=set(), optional=set(),
                       tool_name="emdash_list_taxonomies")
     data = _call("emdash_list_taxonomies", "taxonomy_list", {})
-    items = data.get("items") if isinstance(data, dict) else data
-    count = len(items) if isinstance(items, list) else "?"
+    # Try common list-bearing keys before falling back to "?".
+    count: int | str = "?"
+    if isinstance(data, list):
+        count = len(data)
+    elif isinstance(data, dict):
+        for key in ("items", "taxonomies", "results"):
+            value = data.get(key)
+            if isinstance(value, list):
+                count = len(value)
+                break
     return _wrap_result(
         "emdash_list_taxonomies",
         data,
