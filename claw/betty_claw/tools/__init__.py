@@ -75,12 +75,16 @@ from betty_claw.tools.emdash_reads import (
     emdash_list_taxonomy_terms,
 )
 from betty_claw.tools.emdash_writes import (
+    EMDASH_CREATE_COLLECTION_SCHEMA,
     EMDASH_CREATE_CONTENT_DRAFT_SCHEMA,
+    EMDASH_CREATE_FIELD_SCHEMA,
     EMDASH_CREATE_TAXONOMY_TERM_SCHEMA,
     EMDASH_PUBLISH_CONTENT_SCHEMA,
     EMDASH_UNPUBLISH_CONTENT_SCHEMA,
     EMDASH_UPDATE_CONTENT_DRAFT_SCHEMA,
+    emdash_create_collection,
     emdash_create_content_draft,
+    emdash_create_field,
     emdash_create_taxonomy_term,
     emdash_publish_content,
     emdash_unpublish_content,
@@ -224,6 +228,21 @@ TOOLS: dict[str, ToolEntry] = {
     "emdash_create_taxonomy_term": ToolEntry(
         callable=emdash_create_taxonomy_term,
         schema=EMDASH_CREATE_TAXONOMY_TERM_SCHEMA,
+        risk_class="reversible_write",
+    ),
+
+    # ----- Phase 4.6 substage (c): schema DDL tools (smoke test T01) -----
+    # Add new collections / fields to EmDash. Both reversible_write —
+    # server-side CMS state changes, reversible via admin UI delete; no
+    # public-facing impact until content lands.
+    "emdash_create_collection": ToolEntry(
+        callable=emdash_create_collection,
+        schema=EMDASH_CREATE_COLLECTION_SCHEMA,
+        risk_class="reversible_write",
+    ),
+    "emdash_create_field": ToolEntry(
+        callable=emdash_create_field,
+        schema=EMDASH_CREATE_FIELD_SCHEMA,
         risk_class="reversible_write",
     ),
 

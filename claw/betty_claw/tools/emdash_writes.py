@@ -52,6 +52,31 @@ from betty_claw.tools.emdash_reads import (
 
 
 # ---------------------------------------------------------------------------
+# Schema DDL constants
+# ---------------------------------------------------------------------------
+
+# Slug pattern enforced by EmDash MCP for collection slugs and field slugs.
+# Lowercase letter start, then any number of lowercase letters, digits,
+# and underscores. Match server-side so the validator catches Qwen's
+# typos before the MCP rejection round-trip.
+_SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+
+# Valid field types per the MCP schema_create_field tool. Matches the
+# enum in the 2026-05-26 schema probe.
+VALID_FIELD_TYPES = frozenset({
+    "string", "text", "number", "integer", "boolean", "datetime",
+    "select", "multiSelect", "portableText", "image", "file",
+    "reference", "json", "slug",
+})
+
+# Valid collection "supports" features per the MCP schema_create_collection
+# tool. Default per EmDash is ['drafts', 'revisions'] when omitted.
+VALID_COLLECTION_SUPPORTS = frozenset({
+    "drafts", "revisions", "preview", "scheduling", "search",
+})
+
+
+# ---------------------------------------------------------------------------
 # Collection schemas (locked from 2026-05-26 schema_get_collection probes)
 # ---------------------------------------------------------------------------
 
@@ -656,6 +681,267 @@ def emdash_publish_content(args: dict) -> ToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Schema DDL tools (Phase 4.6 substage (c) addition for smoke test T01)
+# ---------------------------------------------------------------------------
+# These create new collections + fields in EmDash. They're DDL operations
+# (data definition language) rather than DML (the create/update/publish
+# tools above operate on rows within a collection). Both reversible_write:
+# server-side CMS state changes, reversible by admin UI delete. Not
+# external_side_effect because they don't change public-facing content —
+# a new empty collection has no published items and isn't visible on
+# travelpec.com until content lands in it.
+#
+# Smoke test T01 uses exactly these two: create a `smoketest` collection,
+# then create a single `text` field. Two MCP calls, one task per Hard
+# Rule 4.
+
+# ---------------------------------------------------------------------------
+# Tool: emdash_create_collection
+# ---------------------------------------------------------------------------
+
+EMDASH_CREATE_COLLECTION_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "emdash_create_collection",
+        "description": (
+            "Create a new content collection (content type) in EmDash. "
+            "Adds a database table and schema definition. Use to add new "
+            "kinds of content to the CMS (e.g. a 'press_releases' "
+            "collection). For travelpec.com Phase 4.6 the existing four "
+            "collections (stays/villages/articles/itineraries) cover the "
+            "scope — this tool is used by the smoke test to create a "
+            "`smoketest` collection that exercises the MCP write path."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": (
+                        "Unique collection identifier. Lowercase letters, "
+                        "numbers, underscores; must start with a letter "
+                        "(pattern ^[a-z][a-z0-9_]*$)."
+                    ),
+                },
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "Plural display name shown in the admin UI "
+                        "(e.g. 'Blog Posts', 'Smoke Tests')."
+                    ),
+                },
+                "labelSingular": {
+                    "type": "string",
+                    "description": "Singular display name (e.g. 'Blog Post').",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description of what this collection holds.",
+                },
+                "supports": {
+                    "type": "array",
+                    "description": (
+                        "Optional features. Valid values: drafts, "
+                        "revisions, preview, scheduling, search. Defaults "
+                        "to ['drafts', 'revisions'] if omitted."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "drafts", "revisions", "preview",
+                            "scheduling", "search",
+                        ],
+                    },
+                },
+            },
+            "required": ["slug", "label"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def emdash_create_collection(args: dict) -> ToolResult:
+    """Create a new EmDash collection. risk_class=reversible_write."""
+    _assert_dict_keys(
+        args,
+        required={"slug", "label"},
+        optional={"labelSingular", "description", "supports"},
+        tool_name="emdash_create_collection",
+    )
+    _assert_str(args["slug"], "slug", "emdash_create_collection")
+    if not _SLUG_PATTERN.match(args["slug"]):
+        raise ValueError(
+            f"emdash_create_collection.slug must match {_SLUG_PATTERN.pattern!r}; "
+            f"got {args['slug']!r}"
+        )
+    _assert_str(args["label"], "label", "emdash_create_collection")
+    if "labelSingular" in args:
+        _assert_str(args["labelSingular"], "labelSingular",
+                    "emdash_create_collection")
+    if "description" in args:
+        _assert_str(args["description"], "description",
+                    "emdash_create_collection")
+    if "supports" in args:
+        supports = args["supports"]
+        if not isinstance(supports, list):
+            raise ValueError(
+                f"emdash_create_collection.supports must be list, "
+                f"got {type(supports).__name__}"
+            )
+        for s in supports:
+            if s not in VALID_COLLECTION_SUPPORTS:
+                raise ValueError(
+                    f"emdash_create_collection.supports has invalid value "
+                    f"{s!r}; allowed: {sorted(VALID_COLLECTION_SUPPORTS)}"
+                )
+
+    mcp_args: dict[str, Any] = {
+        "slug": args["slug"],
+        "label": args["label"],
+    }
+    for k in ("labelSingular", "description", "supports"):
+        if k in args:
+            mcp_args[k] = args[k]
+
+    response = _call(
+        "emdash_create_collection",
+        "schema_create_collection",
+        mcp_args,
+    )
+
+    return _wrap_result(
+        "emdash_create_collection",
+        response,
+        f"Created collection {args['slug']!r} (label: {args['label']!r}).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: emdash_create_field
+# ---------------------------------------------------------------------------
+
+EMDASH_CREATE_FIELD_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "emdash_create_field",
+        "description": (
+            "Add a new field to an existing EmDash collection. Adds a "
+            "column to the underlying table. Field types: string "
+            "(short text), text (long text), number, integer, boolean, "
+            "datetime, select, multiSelect, portableText (rich text), "
+            "image, file, reference, json, slug. Smoke test T01 uses "
+            "this to add a single `note` text field to the `smoketest` "
+            "collection after creating it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "type": "string",
+                    "description": (
+                        "Slug of the collection to add the field to. "
+                        "Must exist (use emdash_create_collection first "
+                        "for new collections)."
+                    ),
+                },
+                "slug": {
+                    "type": "string",
+                    "description": (
+                        "Field identifier. Lowercase letters, numbers, "
+                        "underscores; starts with a letter "
+                        "(pattern ^[a-z][a-z0-9_]*$)."
+                    ),
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Display name for the field.",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": sorted(VALID_FIELD_TYPES),
+                    "description": "Data type for the field.",
+                },
+                "required": {
+                    "type": "boolean",
+                    "description": "Whether the field is required (default false).",
+                },
+                "validation": {
+                    "type": "object",
+                    "description": (
+                        "Optional validation constraints "
+                        "(min, max, minLength, maxLength, pattern, options). "
+                        "Pass-through to EmDash."
+                    ),
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["collection", "slug", "label", "type"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def emdash_create_field(args: dict) -> ToolResult:
+    """Add a field to an EmDash collection. risk_class=reversible_write."""
+    _assert_dict_keys(
+        args,
+        required={"collection", "slug", "label", "type"},
+        optional={"required", "validation"},
+        tool_name="emdash_create_field",
+    )
+    _assert_str(args["collection"], "collection", "emdash_create_field")
+    _assert_str(args["slug"], "slug", "emdash_create_field")
+    if not _SLUG_PATTERN.match(args["slug"]):
+        raise ValueError(
+            f"emdash_create_field.slug must match {_SLUG_PATTERN.pattern!r}; "
+            f"got {args['slug']!r}"
+        )
+    _assert_str(args["label"], "label", "emdash_create_field")
+    if args["type"] not in VALID_FIELD_TYPES:
+        raise ValueError(
+            f"emdash_create_field.type must be one of "
+            f"{sorted(VALID_FIELD_TYPES)}; got {args['type']!r}"
+        )
+    if "required" in args:
+        if not isinstance(args["required"], bool):
+            raise ValueError(
+                f"emdash_create_field.required must be bool, "
+                f"got {type(args['required']).__name__}"
+            )
+    if "validation" in args:
+        if not isinstance(args["validation"], dict):
+            raise ValueError(
+                f"emdash_create_field.validation must be dict, "
+                f"got {type(args['validation']).__name__}"
+            )
+
+    mcp_args: dict[str, Any] = {
+        "collection": args["collection"],
+        "slug": args["slug"],
+        "label": args["label"],
+        "type": args["type"],
+    }
+    for k in ("required", "validation"):
+        if k in args:
+            mcp_args[k] = args[k]
+
+    response = _call(
+        "emdash_create_field",
+        "schema_create_field",
+        mcp_args,
+    )
+
+    return _wrap_result(
+        "emdash_create_field",
+        response,
+        f"Added {args['type']} field {args['slug']!r} to collection "
+        f"{args['collection']!r}.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -831,6 +1117,72 @@ def _self_test() -> None:
     except ValueError as e:
         assert "unknown keys" in str(e)
     print("  [ok] emdash_publish_content rejected unknown keys")
+
+    # ---- Schema DDL tools: validator paths ----
+    print()
+    print("Schema DDL tools (Phase 4.6 substage (c)):")
+
+    # emdash_create_collection: missing required label
+    try:
+        emdash_create_collection({"slug": "smoketest"})
+    except ValueError as e:
+        assert "missing required keys" in str(e)
+    print("  [ok] emdash_create_collection rejected missing label")
+
+    # emdash_create_collection: invalid slug pattern
+    try:
+        emdash_create_collection({"slug": "Smoke-Test", "label": "x"})
+    except ValueError as e:
+        assert "must match" in str(e)
+    print("  [ok] emdash_create_collection rejected invalid slug pattern")
+
+    # emdash_create_collection: invalid supports value
+    try:
+        emdash_create_collection({
+            "slug": "smoketest",
+            "label": "Smoke Test",
+            "supports": ["drafts", "telekinesis"],
+        })
+    except ValueError as e:
+        assert "supports has invalid value" in str(e)
+    print("  [ok] emdash_create_collection rejected invalid supports value")
+
+    # emdash_create_field: invalid type
+    try:
+        emdash_create_field({
+            "collection": "smoketest",
+            "slug": "note",
+            "label": "Note",
+            "type": "vibes",
+        })
+    except ValueError as e:
+        assert "type must be one of" in str(e)
+    print("  [ok] emdash_create_field rejected invalid field type")
+
+    # emdash_create_field: invalid slug pattern
+    try:
+        emdash_create_field({
+            "collection": "smoketest",
+            "slug": "Has-Hyphens",
+            "label": "x",
+            "type": "text",
+        })
+    except ValueError as e:
+        assert "must match" in str(e)
+    print("  [ok] emdash_create_field rejected invalid slug pattern")
+
+    # emdash_create_field: required must be bool
+    try:
+        emdash_create_field({
+            "collection": "smoketest",
+            "slug": "note",
+            "label": "Note",
+            "type": "text",
+            "required": "yes",
+        })
+    except ValueError as e:
+        assert "required must be bool" in str(e)
+    print("  [ok] emdash_create_field rejected non-bool required")
 
     print("\nemdash_writes.py self-test PASSED")
 
