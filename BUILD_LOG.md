@@ -1030,3 +1030,295 @@ work or sequential phases. The Cleanup Phase has reduced the structural
 debt that would have made either of those phases noisier; the choice
 between them is now substantive scope work, not a question of "should
 we clean up first."
+
+
+## Phase 4.5 closed — envelope minimum + read_only Judge-skip + judge_decisions audit
+
+Commit: `7351f47` (Phase 4.5: envelope minimum + risk_class + judge_decisions audit)
+
+Phase 4.4 v2 scoping landed `phase-4.4-scoping-kickoff-v2.md` at `17ef5a2`,
+then the scoping decisions log + Phase 4.5 + 4.6 execution kickoff at
+`f9e0647`. Q1 Decisions A+B (risk_class per-tool constant, adapter-populated)
+and Q7 (re-locked to travelpec.com autonomous deploy) closed scoping.
+Phase 4.5 implements the contract changes the kickoff specified.
+
+The win-shape pivot from the scoping chat — "ship travelpec.com deploy as
+the milestone, defer UI/HEARTBEAT/second-executor" — narrowed Phase 4.5
+to exactly what the milestone needs: a uniform envelope contract across
+read_only / reversible_write / external_side_effect risk classes, a
+Judge-skip path for read_only that's structurally enforced, and an audit
+trail that survives DB outages.
+
+### What landed
+
+- `claw/betty_claw/contracts.py` — new `RiskClass` type alias
+  (`Literal["read_only", "reversible_write", "external_side_effect",
+  "high_risk"]`) and new `Envelope` frozen dataclass wrapping `ToolCall +
+  risk_class + authorization_refs`. Envelope is the unit the Judge
+  evaluates; the actor never reasons about risk_class (Q1 Decision B).
+  `authorization_refs` is a forward-compatible empty `list[str]` default;
+  semantic enforcement of who populates and how freshness is established
+  is the contested sub-decision deferred per the scoping decisions log
+  and logged in `OPEN_QUESTIONS.md`.
+
+- `claw/betty_claw/tools/__init__.py` — `ToolEntry` gains a required
+  `risk_class: RiskClass` field with no default. The structural forcing
+  function from Q1 Decision A: every tool registered must declare a
+  constant risk class, splitting any tool that would span multiple
+  classes into atomic siblings. `draft_email` registered with
+  `risk_class="reversible_write"` (writes a proposal JSON file, no
+  external effect, deletable via filesystem).
+
+- `claw/betty_claw/judge.py` — `Judge.before_tool_call` signature changed
+  from `(tool_call: ToolCall, user_request: str)` to `(envelope: Envelope,
+  user_request: str)`. Internal extraction unwraps `envelope.tool_call`
+  for the existing flow. The user message sent to Opus now includes a
+  `Risk class: {envelope.risk_class}` line so the Judge can weigh
+  consequence appropriately. Verified in self-test Scenario 1: Opus's
+  approve reasoning explicitly cited "reversible — creates a draft,
+  doesn't send" using the new signal.
+
+- `claw/betty_claw/actor.py` — inner loop now constructs an `Envelope`
+  by reading `TOOLS[wire_call.name].risk_class` after the tool callable
+  executes. New branch: if `envelope.risk_class == "read_only"`, the
+  actor skips the Judge entirely, writes a `SKIP_READ_ONLY` audit row
+  via `judge_decisions.write_skip(...)`, and returns
+  `outcome="tool_read_only"`. Non-read_only path threads the envelope
+  through the Judge and writes `judge_decisions.write_verdict(...)` rows
+  on both approve and reject branches. The audit row write happens for
+  every envelope evaluated, regardless of outcome — the trail captures
+  what the actor saw, not just what got approved. New
+  `_synthesize_read_only_response()` helper surfaces tool payload back
+  to the user inline (reads return data; writes return a proposal_path).
+  `ActorOutcome` Literal extended with `tool_read_only`. `_MockJudge`
+  updated to take Envelope.
+
+- `ops/schema/002_judge_decisions.sql` — new migration. Minimum audit
+  schema: `id, timestamp, call_id, tool_name, risk_class, envelope_json,
+  verdict (CHECK in 'APPROVE'/'REJECT'/'SKIP_READ_ONLY'), cost_usd,
+  reasoning, executed_at, execution_result`. Four indexes for the audit
+  query patterns the kickoff anticipated (timestamp DESC, tool_name,
+  verdict, call_id). Applied cleanly on first run via existing
+  `apply.sh`.
+
+- `claw/betty_claw/judge_decisions.py` — new writer module. Exposes
+  `write_verdict(envelope, verdict, executed_at, execution_result)` and
+  `write_skip(envelope, executed_at, execution_result)`. Both are
+  best-effort: any DB failure (psycopg import error, connection refused,
+  insert exception) logs a `[WARN]` line to stderr and returns. The
+  audit trail being unavailable must not crash Betty's runtime; the
+  verdict and execution decisions are authoritative. Imports
+  `betty_etl.db.get_conn` lazily so module load doesn't trigger pool
+  initialization. Verdict label normalized at the write boundary:
+  Python's lowercase `decision` → table's uppercase `verdict` CHECK
+  constraint.
+
+- `claw/betty_claw/actor.py` self-test — new Scenario D exercises the
+  read_only Judge-skip path. A synthetic `betty_self_check` tool is
+  registered with `risk_class="read_only"` (try/finally cleanup of
+  the registry mutation). The supplied Judge is an `_ExplosiveJudge`
+  that raises `AssertionError` if `before_tool_call` is ever invoked —
+  proves the Judge-skip is structural, not best-effort. Qwen reliably
+  invoked the tool from the prompt "Please run the betty_self_check
+  tool to confirm Betty's actor loop is healthy."
+
+- `OPEN_QUESTIONS.md` — new "Phase 4.4 scoping deferrals" section with
+  one-line entries for every item the v2 kickoff deliberately deferred:
+  Operator Review UI (Q4, Q5), HEARTBEAT autonomy (was 4.8), generalized
+  dispatcher (Q2), async tool execution (Q3), `judge_decisions` advanced
+  fields (Q6 advanced), authorization sub-decision and freshness, second
+  executor (Q9), Markdown OS spec completion (Q8), `.emlx`/SKILL.md/
+  recall work. Each entry references back to the scoping artifacts.
+
+### Verified live
+
+All four phase 4.5 self-tests passed on first run, no pyc clearing
+required (this phase added new code and changed a method signature but
+did not rename files or delete top-level definitions, so the
+Cleanup Phase's pyc-footgun lesson did not apply):
+
+1. `python -m betty_claw.tools` — registry shape including new
+   `risk_class` field assertions. Free.
+2. `python -m betty_claw.judge_decisions` — wrote 3 rows (APPROVE,
+   REJECT, SKIP_READ_ONLY), read them back via probe query, asserted
+   shape/values, cleaned them up. Free. DB pool initialized on first
+   write call.
+3. `python -m betty_claw.judge` — all six scenarios passed against
+   real Anthropic. Envelope wrapping helper used across scenarios.
+   Total Anthropic cost: $0.1136.
+4. `python -m betty_claw.actor` — Scenarios A (text), B (real Judge
+   approve, ~$0.02 Anthropic), C (MockJudge reject loop, breaker
+   trips at 3), D (read_only Judge-skip with ExplosiveJudge, no
+   verdicts issued, summary surfaced).
+
+Total Anthropic spend for the phase verification gate: approximately
+$0.13. Within the $5/day cap by an order of magnitude.
+
+Structural proof of the Judge-skip discipline: the ExplosiveJudge would
+have raised `AssertionError` if the actor accidentally routed a
+read_only envelope through `before_tool_call`. Scenario D's
+`judge_verdicts=0` and `outcome=tool_read_only` is the load-bearing
+assertion that read_only Judge-skip is a code-path branch, not an
+optimization that can quietly degrade.
+
+Structural proof of the Envelope signature change: the six existing
+Judge scenarios from Phase 4.3 still pass without behavioral change.
+The Phase 4.3 contract (approve/reject verdicts, breaker, cap, corrupt
+ledger handling) is preserved exactly. The only observable difference
+is the user-message prompt now includes a `Risk class:` line, which
+Opus used as additional context for verdict reasoning.
+
+Structural proof of the audit trail: `judge_decisions.py` self-test
+wrote and read back three rows representing the full risk-class span.
+DB-down handling not exercised in this run (Postgres was up); the
+graceful-degradation path is reachable via `try/except Exception:
+print [WARN]` in `_do_insert` and was inspected by code review.
+
+### Locked decisions (carry forward)
+
+- **Envelope is the unit the Judge evaluates.** Not ToolCall. Future
+  envelope fields (evidence_refs, expected_consequence, rollback,
+  sensitivity per the OB1 spec) land on `Envelope`, not on `ToolCall`.
+  `ToolCall` is the actor-produced semantic core; everything else is
+  adapter-populated mechanical metadata.
+
+- **The adapter is currently inline in `actor.py`.** Specifically, the
+  envelope construction `Envelope(tool_call=..., risk_class=TOOLS[name].risk_class)`
+  block. This is intentional Phase 4.5 minimum — extracting a dedicated
+  dispatcher module (Q2 deferred) makes sense only when the same logic
+  needs to live in more than one call site.
+
+- **`risk_class` ride on the Judge prompt.** The user message includes
+  `Risk class: {envelope.risk_class}` so Opus has the signal when
+  reasoning about consequence. This is not a safety-critical
+  affordance (the gating is on the actor side via the Judge-skip
+  branch), but it improves verdict quality. Scenario 1's reasoning
+  text demonstrated Opus picking up on it.
+
+- **Audit writes are best-effort, never blocking.** `judge_decisions`
+  insert failures log `[WARN]` and return. Future operator-UI work
+  that depends on the audit trail being complete will need a separate
+  signal (e.g., "audit row write failed for verdict X" surfaced to
+  the operator) — not in scope until Phase 4.7+.
+
+- **Verdict label normalization at the write boundary.** Python keeps
+  `JudgeVerdict.decision` lowercase per Phase 4.3 contract; the table
+  CHECK constraint is uppercase. `_normalize_verdict_label()` converts.
+  Future code adding new verdict states (e.g., a Stage 6 "revise"
+  verdict) updates both the Literal AND the CHECK constraint AND the
+  normalizer.
+
+- **`authorization_refs` is forward-compat empty.** No validation in
+  Phase 4.5. When the actor-vs-adapter sub-decision lands, this field
+  starts carrying real values, and the Judge prompt likely gains an
+  "Authorization context:" section.
+
+- **Self-tests remain per-module `_self_test()` functions.** No pytest
+  migration this phase. The pattern works for the live-integration
+  shape Betty's tests need (real Anthropic, real Ollama, real
+  Postgres).
+
+### Incidents
+
+**Comment-prefixed multi-line paste broke on zsh.** Peter's first
+attempt at running the self-tests pasted a multi-line block with
+`# Free:` comments and shell-incompatible `$0.10-0.20` glob patterns.
+zsh interpreted each `#` line as a command and the `$0.10` as a
+filename. No code or contract issue — purely a hand-off-instructions
+quality issue. Fix: hand off one command at a time, no embedded
+comments, no shell-special characters.
+
+**Bare `python` vs `uv run python`.** Same hand-off issue: the initial
+test commands used `python -m betty_claw.X`, but Betty's environment
+has `betty_claw` only installed inside the uv workspace
+(`/Users/betty/.pyenv/...` is bare). The correct invocation is
+`uv run python -m betty_claw.X`. The pattern shows up in every
+non-trivial run of this codebase; assistant instructions should
+default to `uv run`.
+
+**No incidents from the contract change itself.** This is worth
+recording because the change was substantial — new dataclass,
+signature change across an active call site, new module, new
+migration — and the verification gate passed on first run for all
+four self-tests. The Phase 4.4 Cleanup-Phase incidents (stale pyc
+after file renames; assistant mis-diagnosing as Qwen non-determinism)
+did not recur because Phase 4.5 added new code and changed a
+signature but didn't rename files or delete top-level definitions.
+
+### Deferred items resolved
+
+The "What's left to do" items from the Phase 4.5 section of
+`phase-4.5-4.6-execution-kickoff.md`:
+
+1. **Extend ToolEntry with risk_class** → landed in commit `7351f47`.
+   Required field, no default, every registration declares it.
+2. **draft_email.risk_class="reversible_write"** → landed.
+3. **Adapter populates risk_class from registry** → inline in
+   `actor.py` per the locked decision above. `Envelope(tool_call=...,
+   risk_class=TOOLS[name].risk_class)` is the adapter logic.
+4. **Actor inner loop skips Judge for read_only** → landed. Scenario D
+   verifies structurally via ExplosiveJudge.
+5. **judge_decisions table migration** → landed and applied.
+6. **Wire Judge to write judge_decisions rows** → wired via
+   `judge_decisions.write_verdict` / `write_skip` called from the
+   actor, not from inside the Judge. The actor is the right caller
+   because it sees both the verdict and the read-only-skip paths.
+7. **Forward-compatible authorization_refs** → landed on `Envelope`,
+   empty list default, no validation.
+8. **Phase 4.5 tests** → all four self-tests pass.
+
+### Operator notes
+
+Carried forward from the Cleanup Phase, with three additions:
+
+- **`uv run python -m betty_claw.X` is the canonical test
+  invocation.** Bare `python` won't find the package. The pattern
+  applies to all four self-tests in this phase and to every existing
+  self-test from Phases 4.1–4.3.
+
+- **The `judge_decisions` table is the audit-trail source of truth
+  for overnight runs.** `SELECT ... FROM judge_decisions WHERE
+  timestamp > '<yesterday>' ORDER BY timestamp` answers "what did
+  Betty do overnight" without log scraping. The `envelope_json`
+  column carries the full Envelope shape for replay; `executed_at`
+  is non-null on APPROVE and SKIP_READ_ONLY rows, null on REJECT.
+
+- **Read-only tools execute directly, no Judge round-trip.** Operator
+  intuition for cost estimation: any read_only tool call in a
+  Phase 4.6+ overnight run is free (no Anthropic charge); only
+  reversible_write and external_side_effect calls hit the $5/day cap.
+
+### Phase 4.6 opens with
+
+Per the execution kickoff, Phase 4.6 implements the tool surface for
+the travelpec.com autonomous-deploy milestone. The first step before
+implementation begins is the **Emdash MCP scope checkpoint**: does
+travelpec.com content live in the Emdash CMS (requires `emdash_*`
+MCP tool wrappers) or in Astro markdown content collections written
+to the repo (covered by `write_file` alone)? The kickoff commits to
+Astro markdown by default; Emdash MCP tools are an additive layer if
+the content actually lives in the CMS.
+
+Tool surface to implement (subject to the Emdash checkpoint outcome):
+
+- `read_file(path)` — read_only
+- `list_directory(path)` — read_only
+- `git_status()` — read_only
+- `git_diff(path?, staged?)` — read_only
+- `write_file(path, content)` — reversible_write
+- `git_commit_all(message)` — reversible_write
+- `git_push(remote, branch)` — external_side_effect
+
+Each tool's `_self_test()` becomes another guard against
+contract-drift between the schema Qwen sees and the validator the
+tool enforces. The Phase 4.3 discipline applies unchanged: validate
+arguments before generating call_ids or writing to disk; atomic JSON
+writes via `atomic_io`; the per-tool risk_class is the structural
+forcing function that keeps each tool atomic.
+
+After Phase 4.6 lands, the acceptance test is the first overnight
+travelpec.com run. That run will be Betty's first end-to-end
+autonomous external-side-effect operation. If it succeeds, the
+six-phase plan collapses to "this is the win"; if it fails, the
+audit trail in `judge_decisions` is the diagnostic input for the
+post-mortem.
