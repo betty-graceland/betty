@@ -1930,3 +1930,213 @@ chain. The deferred items from Phase 4.4 scoping (UI, HEARTBEAT,
 second executor, authorization freshness, dispatcher abstraction)
 remain deferred — the win was the architecture itself running
 end-to-end, and we got that without paying their costs.
+
+
+## Phase 4.6.1 closed — Airbnb dossier parser validated against real input
+
+Commits: `7d941ef` (parser + registry update), `9622cb5` (BETTY_RESEARCH_DIR
+third allow-list root), `15170fa` (frontmatter list-promotion fix), plus
+this closure commit.
+
+Phase 4.6.1 was scoped at Phase 4.6 substage (c) closure as the dossier
+parser that bridges the 35 scraped Airbnb research dossiers into the
+content-population pipeline. Built and validated end-to-end against a
+real dossier (`3_Bed_PEC_Home_Loads_of_Style_12_hr_to_Sandbanks.md`)
+on 2026-05-26. Registry now holds 22 tools.
+
+### What landed
+
+- **`claw/betty_claw/tools/airbnb_parser.py`** — new tool
+  `parse_airbnb_dossier(path)` with `risk_class=read_only`. Reads a
+  dossier markdown file (YAML frontmatter + scraped page body) and
+  returns a Stays-collection-compatible dict. Self-test exercises the
+  inner parsers (frontmatter, persona, description, property_type
+  mapping) plus the full tool round-trip with a synthetic dossier, plus
+  validation failure modes (path traversal, missing path arg, dossier
+  missing required frontmatter field).
+
+  Implementation notes worth carrying forward:
+
+  - **Minimal rolled YAML-frontmatter parser, no PyYAML dep.** Handles
+    the constrained shape these dossiers use: flat key:value pairs
+    (str/int/float/bool/null) plus lists with `- item` indented lines.
+    If dossiers grow nested objects or multi-line strings, swap in
+    PyYAML.
+
+  - **Cruft-stripping for the scraped body.** A regex pattern list
+    filters lines that match known Airbnb-page navigation
+    ("Show all photos", review cards, "Add dates", date pickers,
+    star rating breakdowns, etc.) so the extracted description is
+    composed of substantive listing prose only.
+
+  - **Persona = first descriptive sentence.** Heuristic: first
+    non-cruft line ≥60 chars, take up to the first sentence boundary
+    after char 30. On the real Parsonage dossier this produced
+    "3 Bed / 3.5 Bath PEC Heritage Home – The Parsonage blends
+    rustic charm with modern elegance." — clean editorial-ready.
+
+  - **`schema_subtype` from `property_type`.** Mapping table covers
+    Apartment, BedAndBreakfast, Hotel, defaults to VacationRental
+    (matches the existing Stays entries' subtype usage).
+
+  - **Hard rules enforced structurally:** `provider="airbnb"` always,
+    `is_advertised=0` always, `featured_eligible=0` always. The
+    parser has no path for Qwen to override these — they're set in
+    the tool body, not read from frontmatter.
+
+  - **Defense in depth:** the assembled Stays dict is run through
+    `_validate_data_for_collection('stays', ..., partial=False)`
+    before returning. If the parser ever produces something the
+    write tool would reject, that's a parser bug caught at parse
+    time, not when `emdash_create_content_draft` later rejects it.
+
+- **`BETTY_RESEARCH_DIR` — third env-bound allow-list root.** Filesystem
+  architectural finding: the SOP folder `01-source-data/` (with the 35
+  dossiers + the article research files) lives at `~/travelpec-com`
+  on Betty's Mac, NOT in the Drive-synced `~/My Drive/Betty/emdash-sites/
+  travelpec.com-v3/`. Two distinct sync mechanics — the Drive holds
+  metadata folders (`00-kickoff`, `02-ui-polish`, etc.), local disk
+  holds source data. `READ_ROOTS` is now `(BETTY_SITE_DIR,
+  BETTY_DOCS_DIR, BETTY_RESEARCH_DIR)`; `WRITE_ROOTS` unchanged.
+  Path-traversal blocking continues to enforce structurally — only
+  paths resolving under one of the three roots are accepted.
+
+### Verified live
+
+Self-test PASSED on Betty's Mac, 2026-05-26 evening:
+
+  - Frontmatter parsed: 18 fields including `images` list (2 items),
+    `price_per_night` empty string (correctly distinguished from list).
+  - Body extracted (no frontmatter delimiters in the body).
+  - Persona extracted (145 chars), description extracted (484 chars,
+    cruft-stripped).
+  - property_type → schema_subtype mapping correct across 5 cases.
+  - Full tool round-trip — Stays dict validates against
+    `COLLECTION_SCHEMAS`.
+  - Path traversal blocked on `/etc/passwd`.
+  - Missing path arg + dossier missing required frontmatter field
+    both caught.
+
+Live parse against the real `3_Bed_PEC_Home_Loads_of_Style_12_hr_to_Sandbanks.md`
+dossier (after fixing the list-promotion bug — see Incidents): the
+parsed output includes title, village=Sandbanks, persona = the actual
+one-sentence Parsonage summary from the listing body, outbound_url
+correctly pulled from frontmatter, bedrooms=3.0, capacity=6.0,
+schema_subtype=VacationRental. The description field carries a
+2000-char cruft-stripped block of the listing's substantive prose —
+the Parsonage's actual self-description, ready for Qwen to either
+pass through or rewrite into editorial voice.
+
+### Locked decisions (carry forward)
+
+- **Three allow-list roots, not two.** `BETTY_SITE_DIR` (write+read),
+  `BETTY_DOCS_DIR` (read), `BETTY_RESEARCH_DIR` (read). The naming
+  is now load-bearing for future operator confusion: docs are
+  Drive-synced metadata; research is local source data; site is the
+  Astro codebase.
+
+- **Parsers are tools, not utilities.** `parse_airbnb_dossier` is in
+  the registry as a `read_only` tool, callable by Qwen via the actor
+  loop. Future parsers (article research, itinerary research) follow
+  the same pattern: registry-registered, schema for Qwen, validators
+  for input, returns a collection-compatible dict in the payload.
+
+- **`is_advertised=0` is structural at parse time.** The parser
+  never reads `is_advertised` from frontmatter (none of the dossiers
+  carry that field anyway). Peter manually flips the three
+  Peter+Amber properties to 1 in the EmDash admin UI after
+  publication, per the locked decision from substage (a).
+
+### Incidents
+
+**YAML frontmatter list-promotion bug.** The first-pass parser
+initialized empty-value keys to `""` (e.g. `images:` line with no
+value yet) and set `current_list_key` so subsequent `- item` lines
+would append. But the append called on a string raised
+`AttributeError: 'str' object has no attribute 'append'`. The
+synthetic self-test exposed this on the real-dossier run because
+the synthetic test that had passed used `images: ...` differently.
+Fix: rewrote the single-pass loop to promote `str → list` on the
+first list item under `current_list_key`. Removed the broken
+second-pass list-promotion code that the rewrite obsoleted.
+Lesson: synthetic test inputs need to match real input shape
+exactly, including the "key: with no value, then `- items`" pattern.
+
+**Path mismatch on first live parse attempt.** The first attempt
+to parse a real dossier failed with `Dossier file does not exist`
+because I assumed the dossiers were at
+`~/My Drive/Betty/emdash-sites/travelpec.com-v3/01-source-data/
+research/airbnb-listings/` (under BETTY_DOCS_DIR). They aren't.
+The Drive mirror holds only the metadata folders; the `01-source-data/`
+tree is at `~/travelpec-com/01-source-data/` on Betty's Mac local
+disk. Surfaced the architectural distinction: Drive is for
+collaboration-friendly metadata; local disk is for source data
+that doesn't need to round-trip. Added `BETTY_RESEARCH_DIR` as the
+third allow-list root. Carries forward: when adding new sites
+(lingerieshoppe, kPixies), each will have its own
+`BETTY_RESEARCH_DIR` path; the env-driven config pattern handles
+this without code changes.
+
+**Cosmetic: an empty path arg surfaces as a non-empty-string error,
+not a missing-arg error.** The shell script `FIRST=$(ls ...)`
+captured an empty string when the directory didn't exist; passed
+to the parser, it tripped `_assert_str` ("must be non-empty")
+rather than the path-validation error. Not a parser bug, but worth
+noting — the script's `set -e` would have caught the bad `ls`
+sooner if we'd been strict-mode. For future runner scripts, prefer
+`set -euo pipefail` at the top so bad expansions don't cascade.
+
+### Deferred items
+
+- **Article dossier parser.** Peter shared a sample
+  (`attractions-beaches.md`) alongside the Airbnb sample. Articles
+  have the same YAML-frontmatter-plus-body shape but the
+  frontmatter fields differ (`url_path`, `primary_keyword`,
+  `page_type` vs Airbnb's `url`, `listing_id`, `village`, etc.)
+  and the body is already-curated editorial markdown rather than
+  scraped page cruft. Phase 4.6.3 will build `parse_article_dossier`
+  with a different mapping (title/excerpt/body to Articles schema,
+  decide whether to keep existing `kind` enum or extend with the
+  new `page_type` values).
+
+- **End-to-end chain validation for one dossier.** Phase 4.6.2: drive
+  Betty through `parse_airbnb_dossier` → `emdash_create_content_draft`
+  → (Peter eyeball in admin UI) → `emdash_publish_content` for one
+  listing. Validates the full content-population pipeline against
+  real data before scaling to all 35. Three actor_turn calls, two
+  Judge round-trips (parse is read_only Judge-skip).
+
+- **Itinerary dossier parser.** Two existing Itineraries are simple
+  (title/duration_nights/persona/summary/body). The research
+  dossiers that become new Itineraries probably follow a similar
+  pattern. Phase 4.6.4 candidate.
+
+- **Bulk-dossier orchestration.** After 4.6.2 proves the chain on
+  one listing, the next question is how Betty processes 35 dossiers
+  efficiently. Sequential actor_turn calls work but cost ~$0.05 in
+  Judge round-trips per listing (~$1.75 for all 35). The
+  $5/day cap accommodates one batch; a "process the next 10
+  unprocessed dossiers" loop becomes Phase 4.6.5+ work.
+
+### Operator notes
+
+- **`BETTY_RESEARCH_DIR=~/travelpec-com` is the local-disk root for
+  research dossiers.** When working on a different site, override
+  via env: `export BETTY_RESEARCH_DIR=~/lingerieshoppe-com` (or
+  wherever that site's source data lives).
+
+- **The parser is a Qwen-callable tool, not a setup utility.** Future
+  workflows drive it via actor_turn prompts like *"Parse the Airbnb
+  dossier at /Users/betty/travelpec-com/.../<file>.md and report
+  the Stays data."* Qwen invokes `parse_airbnb_dossier`, gets the
+  Stays dict, then in the next turn drives `emdash_create_content_draft`
+  with that data.
+
+### Phase 4.6.1 sealed
+
+Parser is end-to-end validated. Real dossier produces a clean Stays
+dict. Next architectural step is Phase 4.6.2 — the
+single-listing end-to-end chain validation through the actor:
+parse one dossier, draft one Stays entry, eyeball, publish. If that
+chain works, scaling to 35 listings is a runner-script problem,
+not a contract problem.
