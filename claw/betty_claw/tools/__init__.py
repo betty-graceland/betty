@@ -41,6 +41,52 @@ from dataclasses import dataclass
 from typing import Callable
 
 from betty_claw.tools.draft_email import DRAFT_EMAIL_SCHEMA, draft_email
+
+from betty_claw.tools.filesystem import (
+    LIST_DIRECTORY_SCHEMA,
+    READ_FILE_SCHEMA,
+    WRITE_FILE_SCHEMA,
+    list_directory,
+    read_file,
+    write_file,
+)
+from betty_claw.tools.git_ops import (
+    GIT_COMMIT_ALL_SCHEMA,
+    GIT_DIFF_SCHEMA,
+    GIT_PUSH_SCHEMA,
+    GIT_STATUS_SCHEMA,
+    git_commit_all,
+    git_diff,
+    git_push,
+    git_status,
+)
+from betty_claw.tools.emdash_reads import (
+    EMDASH_GET_COLLECTION_SCHEMA_SCHEMA,
+    EMDASH_GET_CONTENT_SCHEMA,
+    EMDASH_LIST_COLLECTIONS_SCHEMA,
+    EMDASH_LIST_CONTENT_SCHEMA,
+    EMDASH_LIST_TAXONOMIES_SCHEMA,
+    EMDASH_LIST_TAXONOMY_TERMS_SCHEMA,
+    emdash_get_collection_schema,
+    emdash_get_content,
+    emdash_list_collections,
+    emdash_list_content,
+    emdash_list_taxonomies,
+    emdash_list_taxonomy_terms,
+)
+from betty_claw.tools.emdash_writes import (
+    EMDASH_CREATE_CONTENT_DRAFT_SCHEMA,
+    EMDASH_CREATE_TAXONOMY_TERM_SCHEMA,
+    EMDASH_PUBLISH_CONTENT_SCHEMA,
+    EMDASH_UNPUBLISH_CONTENT_SCHEMA,
+    EMDASH_UPDATE_CONTENT_DRAFT_SCHEMA,
+    emdash_create_content_draft,
+    emdash_create_taxonomy_term,
+    emdash_publish_content,
+    emdash_unpublish_content,
+    emdash_update_content_draft,
+)
+
 from betty_claw.contracts import RiskClass, ToolResult
 
 
@@ -68,6 +114,7 @@ class ToolEntry:
 
 
 TOOLS: dict[str, ToolEntry] = {
+    # ----- Phase 4.3: proposal-writing tool -----
     # draft_email writes a proposal JSON file to disk. No external side
     # effect (no SMTP send), but it does mutate local filesystem state.
     # Reversible: deleting the proposal file undoes it. The Stage 5 send
@@ -78,6 +125,115 @@ TOOLS: dict[str, ToolEntry] = {
         callable=draft_email,
         schema=DRAFT_EMAIL_SCHEMA,
         risk_class="reversible_write",
+    ),
+
+    # ----- Phase 4.6: filesystem tools (Astro source side) -----
+    # Allow-list bounded by BETTY_SITE_DIR + BETTY_DOCS_DIR; path
+    # traversal blocked structurally by the validators.
+    "read_file": ToolEntry(
+        callable=read_file,
+        schema=READ_FILE_SCHEMA,
+        risk_class="read_only",
+    ),
+    "list_directory": ToolEntry(
+        callable=list_directory,
+        schema=LIST_DIRECTORY_SCHEMA,
+        risk_class="read_only",
+    ),
+    "write_file": ToolEntry(
+        callable=write_file,
+        schema=WRITE_FILE_SCHEMA,
+        risk_class="reversible_write",
+    ),
+
+    # ----- Phase 4.6: git tools (Astro source side) -----
+    # Hard Rule 3 (BRIEF) enforced structurally:
+    #   - git_commit_all refuses on `main`
+    #   - git_push hard-codes refspec to HEAD:vic-overnight
+    "git_status": ToolEntry(
+        callable=git_status,
+        schema=GIT_STATUS_SCHEMA,
+        risk_class="read_only",
+    ),
+    "git_diff": ToolEntry(
+        callable=git_diff,
+        schema=GIT_DIFF_SCHEMA,
+        risk_class="read_only",
+    ),
+    "git_commit_all": ToolEntry(
+        callable=git_commit_all,
+        schema=GIT_COMMIT_ALL_SCHEMA,
+        risk_class="reversible_write",
+    ),
+    "git_push": ToolEntry(
+        callable=git_push,
+        schema=GIT_PUSH_SCHEMA,
+        risk_class="external_side_effect",
+    ),
+
+    # ----- Phase 4.6: EmDash MCP read tools (content side) -----
+    # All Judge-skip per Phase 4.5 Decision C. SKIP_READ_ONLY rows
+    # still land in judge_decisions so the audit trail is complete.
+    "emdash_list_collections": ToolEntry(
+        callable=emdash_list_collections,
+        schema=EMDASH_LIST_COLLECTIONS_SCHEMA,
+        risk_class="read_only",
+    ),
+    "emdash_get_collection_schema": ToolEntry(
+        callable=emdash_get_collection_schema,
+        schema=EMDASH_GET_COLLECTION_SCHEMA_SCHEMA,
+        risk_class="read_only",
+    ),
+    "emdash_list_content": ToolEntry(
+        callable=emdash_list_content,
+        schema=EMDASH_LIST_CONTENT_SCHEMA,
+        risk_class="read_only",
+    ),
+    "emdash_get_content": ToolEntry(
+        callable=emdash_get_content,
+        schema=EMDASH_GET_CONTENT_SCHEMA,
+        risk_class="read_only",
+    ),
+    "emdash_list_taxonomies": ToolEntry(
+        callable=emdash_list_taxonomies,
+        schema=EMDASH_LIST_TAXONOMIES_SCHEMA,
+        risk_class="read_only",
+    ),
+    "emdash_list_taxonomy_terms": ToolEntry(
+        callable=emdash_list_taxonomy_terms,
+        schema=EMDASH_LIST_TAXONOMY_TERMS_SCHEMA,
+        risk_class="read_only",
+    ),
+
+    # ----- Phase 4.6: EmDash MCP write tools (content side) -----
+    "emdash_create_content_draft": ToolEntry(
+        callable=emdash_create_content_draft,
+        schema=EMDASH_CREATE_CONTENT_DRAFT_SCHEMA,
+        risk_class="reversible_write",
+    ),
+    "emdash_update_content_draft": ToolEntry(
+        callable=emdash_update_content_draft,
+        schema=EMDASH_UPDATE_CONTENT_DRAFT_SCHEMA,
+        risk_class="reversible_write",
+    ),
+    "emdash_unpublish_content": ToolEntry(
+        callable=emdash_unpublish_content,
+        schema=EMDASH_UNPUBLISH_CONTENT_SCHEMA,
+        risk_class="reversible_write",
+    ),
+    "emdash_create_taxonomy_term": ToolEntry(
+        callable=emdash_create_taxonomy_term,
+        schema=EMDASH_CREATE_TAXONOMY_TERM_SCHEMA,
+        risk_class="reversible_write",
+    ),
+
+    # ----- Phase 4.6: EmDash external-side-effect tool -----
+    # emdash_publish_content makes content live on travelpec.com — the
+    # only tool that pushes data into the public-facing internet.
+    "emdash_publish_content": ToolEntry(
+        callable=emdash_publish_content,
+        schema=EMDASH_PUBLISH_CONTENT_SCHEMA,
+        risk_class="external_side_effect",
     ),
 }
 

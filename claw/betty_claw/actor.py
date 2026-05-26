@@ -74,6 +74,7 @@ from betty_claw.ollama_client import (
     OllamaClient,
 )
 from betty_claw.tools import TOOLS, get_ollama_tools_schema, get_tool
+from betty_claw.tools.filesystem import BETTY_DOCS_DIR
 from betty_claw.contracts import Envelope, JudgeVerdict, ToolCall, ToolResult
 
 
@@ -82,9 +83,23 @@ from betty_claw.contracts import Envelope, JudgeVerdict, ToolCall, ToolResult
 # Markdown OS load order is LOCKED. Reordering breaks KV prefix caching
 # and Friction 4 mitigation. AGENTS rarely changes, USER changes weekly,
 # MEMORY changes per turn — stable to volatile is the cache-friendly order.
+#
+# Phase 4.6 addition: per-site voice calibration loads BETWEEN USER and
+# MEMORY (handled in load_markdown_os, not via this tuple). This keeps
+# the [AGENTS, USER, VOICE] prefix stable across turns within a single
+# site while MEMORY stays volatile at the tail. The voice doc lives at
+# BETTY_DOCS_DIR/02-voice/03-voice-calibration.md per the standardized
+# Betty site-build SOP — present for travelpec.com, will be present for
+# any future site Betty operates.
 MARKDOWN_OS_LOAD_ORDER = ("AGENTS.md", "USER.md", "MEMORY.md")
 
 BETTY_OS_DIR = Path(__file__).parent / "betty_os"
+
+# Voice calibration path is constructed at load time from BETTY_DOCS_DIR.
+# If the file doesn't exist (e.g., a site without a finalized voice doc),
+# loading silently skips it — voice integration is per-site optional, not
+# load-bearing for the actor loop.
+_VOICE_CALIBRATION_PATH = BETTY_DOCS_DIR / "02-voice" / "03-voice-calibration.md"
 
 DEFAULT_ACTOR_MODEL = "betty-generalist:latest"
 DEFAULT_RETRIEVAL_LIMIT = 5
@@ -140,14 +155,44 @@ class ActorTurn:
 
 # ---------- Markdown OS loading ----------
 
+def _try_load_voice_calibration() -> str | None:
+    """Load the per-site voice calibration doc if it exists.
+
+    Path: `BETTY_DOCS_DIR / 02-voice / 03-voice-calibration.md` per the
+    Betty site-build SOP. Returns the stripped text on success, None
+    if the file doesn't exist OR can't be read.
+
+    Phase 4.6 design choice: voice calibration is always-load (no
+    intent detection). The doc is small relative to the actor context
+    budget, and always-load keeps the prefix [AGENTS, USER, VOICE]
+    cache-stable. If the doc grows large enough to make context cost
+    matter, revisit conditional loading.
+    """
+    try:
+        return _VOICE_CALIBRATION_PATH.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+
+
 def load_markdown_os(directory: Path = BETTY_OS_DIR) -> str:
-    """Load the three Markdown OS files in locked order, concatenated.
+    """Load the Markdown OS files in locked order, concatenated.
+
+    Phase 4.6 inserts the per-site voice calibration between USER.md
+    and MEMORY.md when the voice doc exists. The full assembled prompt
+    is therefore:
+
+        AGENTS.md ─── USER.md ─── [voice calibration?] ─── MEMORY.md
+
+    The voice block sits before the volatile MEMORY tail so the cached
+    prefix grows by the voice doc but doesn't fragment KV cache hits
+    when only MEMORY changes between turns.
 
     Returns one string suitable for use as the system prompt. The
-    delimiter between files is "\n\n---\n\n" so Betty can recognize
+    delimiter between sections is "\n\n---\n\n" so Betty can recognize
     section boundaries if she introspects them.
     """
     parts: list[str] = []
+    voice_inserted = False
     for filename in MARKDOWN_OS_LOAD_ORDER:
         path = directory / filename
         if not path.exists():
@@ -156,6 +201,13 @@ def load_markdown_os(directory: Path = BETTY_OS_DIR) -> str:
                 f"Cannot construct system prompt without all of "
                 f"{MARKDOWN_OS_LOAD_ORDER}."
             )
+        # Insert voice calibration between USER.md (last stable file) and
+        # MEMORY.md (volatile per-turn). Only attempt once per call.
+        if filename == "MEMORY.md" and not voice_inserted:
+            voice = _try_load_voice_calibration()
+            if voice:
+                parts.append(voice)
+            voice_inserted = True
         parts.append(path.read_text().strip())
     return "\n\n---\n\n".join(parts)
 
