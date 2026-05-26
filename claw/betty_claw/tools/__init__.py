@@ -1,10 +1,11 @@
 """
 Tool registry for Betty's actor.
 
-Each tool is a (callable, schema) pair. The callable validates its
-arguments and writes a proposal JSON file to disk; the schema is the
-OpenAI/Ollama function-calling shape that Qwen sees so it knows how
-to invoke the tool.
+Each tool is a (callable, schema, risk_class) triple. The callable validates
+its arguments and writes a proposal JSON file to disk; the schema is the
+OpenAI/Ollama function-calling shape that Qwen sees so it knows how to
+invoke the tool; the risk_class is the mechanical metadata the adapter
+reads to construct the OB1 Envelope before the Judge sees it.
 
 Tools must validate their own arguments before generating a call_id or
 writing to disk. See draft_email.py for the canonical pattern. The
@@ -13,16 +14,25 @@ additionalProperties policy — drift between them produces calls that
 Qwen will emit but the tool will reject, or calls the tool would accept
 but Qwen doesn't know how to construct.
 
-The TOOLS registry is the single source of truth for what tools exist.
-The actor (Phase 4.3) reads TOOLS to dispatch calls and to surface
-schemas to Ollama via get_ollama_tools_schema().
+The TOOLS registry is the single source of truth for what tools exist
+AND for their risk classification. Per Phase 4.4 Q1 Decisions A+B
+(locked 2026-05-24):
 
-Phase 4.3 note: this module's shape changed from Phase 4.2. Phase 4.2
-had TOOLS: Dict[str, Callable] only. Phase 4.3 wraps each entry in a
-ToolEntry (callable + schema) because the actor now needs to pass
-schemas to Ollama for native tool-calling. No existing code consumed
-the Phase 4.2 shape, so this is an additive change in spirit despite
-the type signature change.
+  - risk_class is a per-tool constant declared here in the registry.
+    Tools that would span multiple risk classes must be split into
+    multiple atomic tools, each with its own constant risk_class.
+
+  - The adapter populates risk_class onto the Envelope at envelope-
+    construction time by reading TOOLS[tool_name].risk_class. The
+    actor (Qwen) never reasons about risk_class — never sees it,
+    never emits it.
+
+Phase 4.3 wrapped each entry in a ToolEntry (callable + schema) because
+the actor needs to pass schemas to Ollama for native tool-calling.
+Phase 4.5 adds risk_class as a third required field. No defaults; every
+tool must declare its risk class explicitly — that's the structural
+forcing function that produces atomic, intent-driven tools instead of
+monolithic CRUD wrappers.
 """
 
 from __future__ import annotations
@@ -31,12 +41,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 from betty_claw.tools.draft_email import DRAFT_EMAIL_SCHEMA, draft_email
-from betty_claw.contracts import ToolResult
+from betty_claw.contracts import RiskClass, ToolResult
 
 
 @dataclass(frozen=True)
 class ToolEntry:
-    """One registered tool: its callable and its Ollama-facing schema.
+    """One registered tool: its callable, its Ollama-facing schema, and its
+    risk class.
 
     The callable accepts a dict of arguments (the raw, untrusted shape
     produced by Qwen's tool-call output) and returns a ToolResult.
@@ -44,15 +55,29 @@ class ToolEntry:
     The schema is the OpenAI/Ollama function-calling shape that Qwen
     sees. It MUST match the callable's validation rules — same
     required fields, same types, same additionalProperties policy.
+
+    The risk_class is one of the four locked OB1 risk classes. It is a
+    per-tool constant; if a tool's design spans multiple risk classes
+    it must be split into multiple atomic tools. The adapter reads
+    this value to populate Envelope.risk_class before the Judge sees
+    the proposal. The actor never sees or reasons about risk_class.
     """
     callable: Callable[[dict], ToolResult]
     schema: dict
+    risk_class: RiskClass
 
 
 TOOLS: dict[str, ToolEntry] = {
+    # draft_email writes a proposal JSON file to disk. No external side
+    # effect (no SMTP send), but it does mutate local filesystem state.
+    # Reversible: deleting the proposal file undoes it. The Stage 5 send
+    # tool will be a separate registration with risk_class="external_side_effect"
+    # and an adapter-level legal boilerplate footer (operational boundary #2
+    # from Phase 4.4 scoping decisions).
     "draft_email": ToolEntry(
         callable=draft_email,
         schema=DRAFT_EMAIL_SCHEMA,
+        risk_class="reversible_write",
     ),
 }
 
@@ -91,7 +116,7 @@ __all__ = ["TOOLS", "ToolEntry", "get_tool", "get_ollama_tools_schema"]
 
 def _self_test() -> None:
     """Verify the registry exposes the expected shape and contents."""
-    print("Phase 4.3 tool registry self-test")
+    print("Phase 4.5 tool registry self-test")
     print()
 
     print(f"Registered tools: {sorted(TOOLS.keys())}")
@@ -100,6 +125,33 @@ def _self_test() -> None:
         f"TOOLS values must be ToolEntry, got {type(TOOLS['draft_email'])}"
     )
     print("  [ok] TOOLS is dict[str, ToolEntry]")
+
+    # Phase 4.5: every tool MUST declare risk_class. No defaults, no
+    # optionality — that's the structural forcing function. Verify every
+    # registered tool has a valid risk_class string.
+    valid_risk_classes = {
+        "read_only",
+        "reversible_write",
+        "external_side_effect",
+        "high_risk",
+    }
+    for name, entry in TOOLS.items():
+        assert hasattr(entry, "risk_class"), (
+            f"ToolEntry for {name!r} missing risk_class field"
+        )
+        assert entry.risk_class in valid_risk_classes, (
+            f"Tool {name!r} has invalid risk_class={entry.risk_class!r}; "
+            f"must be one of {sorted(valid_risk_classes)}"
+        )
+        print(f"  [ok] {name!r} risk_class={entry.risk_class!r}")
+
+    # Phase 4.5 contract: draft_email is reversible_write — writes a proposal
+    # file but no external side effect, deletable via filesystem.
+    assert TOOLS["draft_email"].risk_class == "reversible_write", (
+        f"draft_email must be reversible_write per Phase 4.5 kickoff, "
+        f"got {TOOLS['draft_email'].risk_class!r}"
+    )
+    print("  [ok] draft_email risk_class is reversible_write per kickoff")
 
     fn = get_tool("draft_email")
     assert callable(fn), "get_tool should return a callable"

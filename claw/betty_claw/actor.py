@@ -60,19 +60,21 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from betty_etl.retrieval import RetrievalHit, retrieve
 
+from betty_claw import judge_decisions
 from betty_claw.judge import Judge
 from betty_claw.ollama_client import (
     ChatMessage,
     ChatResponse,
     OllamaClient,
 )
-from betty_claw.tools import get_ollama_tools_schema, get_tool
-from betty_claw.contracts import JudgeVerdict, ToolCall, ToolResult
+from betty_claw.tools import TOOLS, get_ollama_tools_schema, get_tool
+from betty_claw.contracts import Envelope, JudgeVerdict, ToolCall, ToolResult
 
 
 # ---------- Configuration ----------
@@ -91,10 +93,11 @@ DEFAULT_WORKSPACE = "betty-dev"
 
 
 # Outcomes the actor can produce. "text" is the Stage 3 baseline; the
-# others are Phase 4.3 tool-calling terminal states.
+# others are Phase 4.3 + 4.5 tool-calling terminal states.
 ActorOutcome = Literal[
     "text",              # Qwen emitted text, no tool calls
     "tool_approved",     # Judge approved a tool call; proposal written
+    "tool_read_only",    # Phase 4.5: read_only tool executed directly, Judge skipped
     "breaker_tripped",   # Per-turn rejection limit hit; halt and escalate
     "cap_exceeded",      # Daily spend cap would be exceeded; halt
     "ledger_corrupt",    # Spend ledger unparseable; halt
@@ -226,6 +229,26 @@ def _synthesize_approval_response(
         f"I prepared a {wire_call_name} proposal for your review. "
         f"The full details are at: {proposal_path}"
     )
+
+
+def _synthesize_read_only_response(
+    wire_call_name: str,
+    tool_result: ToolResult,
+) -> str:
+    """User-facing message when a read_only tool returns data directly.
+
+    Phase 4.5: read_only tools skip the Judge per Q1 Decisions A+B.
+    Their ToolResult.payload IS the answer to the user; the actor
+    surfaces it inline rather than pointing at a proposal file.
+
+    The surface here is intentionally minimal. Phase 4.6 will likely
+    refine this once we have real read-only tools (read_file, git_status,
+    etc.) producing structured payloads worth richer formatting.
+    """
+    payload = tool_result.payload
+    if "summary" in payload:
+        return f"{wire_call_name}: {payload['summary']}"
+    return f"{wire_call_name} result: {payload!r}"
 
 
 # ---------- The actor turn ----------
@@ -368,17 +391,50 @@ def actor_turn(
                 )
                 continue
 
-            # Build the types.ToolCall the Judge expects. The tool's
-            # call_id and proposal_path are inside tool_result.payload.
+            executed_at = datetime.now(timezone.utc)
+
+            # Build the ToolCall and wrap it in the Envelope. Per Phase 4.4
+            # Q1 Decision B (locked 2026-05-24), the adapter populates
+            # risk_class from the registry — the actor reads
+            # TOOLS[name].risk_class as mechanical metadata, never reasoning
+            # about it. authorization_refs is forward-compat empty for now;
+            # semantic enforcement is deferred per the scoping decisions log.
             tool_call = ToolCall(
                 tool_name=wire_call.name,
                 arguments=wire_call.arguments,
                 call_id=tool_result.call_id,
             )
-
-            # Ask the Judge.
-            verdict = judge.before_tool_call(
+            envelope = Envelope(
                 tool_call=tool_call,
+                risk_class=TOOLS[wire_call.name].risk_class,
+            )
+
+            # Phase 4.5 Decision C: read_only tools skip the Judge.
+            # The tool already executed above; its payload IS the answer.
+            # Write a SKIP_READ_ONLY audit row and return tool_read_only.
+            if envelope.risk_class == "read_only":
+                judge_decisions.write_skip(
+                    envelope=envelope,
+                    executed_at=executed_at,
+                    execution_result=tool_result.payload,
+                )
+                return ActorTurn(
+                    user_message=user_message,
+                    response=_synthesize_read_only_response(
+                        wire_call.name, tool_result
+                    ),
+                    hits=hits,
+                    chat_response=chat_response,
+                    outcome="tool_read_only",
+                    judge_verdicts=verdicts,
+                    iterations=iteration,
+                )
+
+            # Non-read_only: existing Judge path. The Judge sees the
+            # full envelope, not just the ToolCall, so risk_class is
+            # part of the prompt context Opus uses to weigh consequence.
+            verdict = judge.before_tool_call(
+                envelope=envelope,
                 user_request=user_message,
             )
             verdicts.append(verdict)
@@ -386,6 +442,12 @@ def actor_turn(
             # Terminal case B: Judge approved.
             if verdict.decision == "approve":
                 proposal_path = tool_result.payload["proposal_path"]
+                judge_decisions.write_verdict(
+                    envelope=envelope,
+                    verdict=verdict,
+                    executed_at=executed_at,
+                    execution_result=tool_result.payload,
+                )
                 return ActorTurn(
                     user_message=user_message,
                     response=_synthesize_approval_response(
@@ -402,6 +464,15 @@ def actor_turn(
             # Reject. Structural branch on cost_usd == 0.0:
             # no-API rejections are terminal (breaker / cap / corrupt);
             # substantive rejections feed back to Qwen and loop.
+            # Both paths land an audit row — the trail captures every
+            # envelope evaluated, not just the approved ones.
+            judge_decisions.write_verdict(
+                envelope=envelope,
+                verdict=verdict,
+                executed_at=None,  # rejected; tool didn't really commit
+                execution_result=None,
+            )
+
             if verdict.cost_usd == 0.0:
                 # Terminal short-circuit.
                 outcome = _classify_short_circuit(verdict.reasoning)
@@ -462,7 +533,10 @@ class _MockJudge:
 
     Implements only the surface actor_turn consumes:
       - reset_turn()
-      - before_tool_call(tool_call, user_request) -> JudgeVerdict
+      - before_tool_call(envelope, user_request) -> JudgeVerdict
+
+    Phase 4.5 signature: takes Envelope, not ToolCall directly. The mock
+    extracts call_id from envelope.tool_call to populate the verdict.
 
     Mirrors the real Judge's two rejection modes:
       - Substantive reject (cost_usd > 0): actor should loop, feed
@@ -486,7 +560,7 @@ class _MockJudge:
         return self._rejections_this_turn
 
     def before_tool_call(
-        self, tool_call: ToolCall, user_request: str
+        self, envelope: Envelope, user_request: str
     ) -> JudgeVerdict:
         self.verdicts_issued += 1
         self._rejections_this_turn += 1
@@ -507,7 +581,7 @@ class _MockJudge:
             )
 
         return JudgeVerdict(
-            call_id=tool_call.call_id,
+            call_id=envelope.tool_call.call_id,
             decision="reject",
             reasoning=reasoning,
             input_tokens=0,
@@ -530,9 +604,14 @@ def _self_test() -> None:
         emits short-circuit rejection on the 3rd; actor should halt
         with outcome='breaker_tripped' after exactly 3 iterations.
 
+    Scenario D (Phase 4.5): read_only Judge-skip. A synthetic read_only
+        tool is temporarily registered. The actor must execute the tool
+        directly and return outcome='tool_read_only' without calling
+        the Judge. _MockJudge is supplied that raises if invoked — proves
+        the Judge-skip path is structural, not best-effort.
+
     Anthropic API cost: scenario B makes one Judge call (~$0.02-0.03).
-    Scenario A makes no Anthropic calls. Scenario C uses MockJudge,
-    no Anthropic calls. Total cost roughly $0.02-0.04.
+    Scenarios A, C, D make no Anthropic calls. Total cost roughly $0.02-0.04.
     """
     import shutil
 
@@ -636,6 +715,124 @@ def _self_test() -> None:
     assert turn.judge_verdicts[1].cost_usd > 0
     assert turn.judge_verdicts[2].cost_usd == 0.0
     print("  [ok] reject loop halted at breaker, no unbounded iteration\n")
+
+    # ---- Scenario D (Phase 4.5): read_only Judge-skip ----
+    print("Scenario D: read_only tool skips Judge entirely")
+
+    # Temporarily register a synthetic read_only tool. The TOOLS registry
+    # is module-level; we mutate it with try/finally cleanup so we don't
+    # leak the synthetic tool to other consumers.
+    SYNTHETIC_TOOL_NAME = "betty_self_check"
+
+    def _synthetic_read_only_tool(args: dict) -> ToolResult:
+        """Synthetic read_only tool used only by this self-test.
+
+        Validates that args is an empty dict, then returns a canned
+        ToolResult that the actor surfaces back to the user. status is
+        'executed' rather than 'proposed' — read_only tools do the real
+        thing rather than writing a proposal stub.
+        """
+        if args:
+            raise ValueError(
+                f"{SYNTHETIC_TOOL_NAME} takes no arguments, got {args!r}"
+            )
+        return ToolResult(
+            call_id=str(uuid.uuid4()),
+            tool_name=SYNTHETIC_TOOL_NAME,
+            status="executed",
+            payload={
+                "summary": (
+                    "Betty self-check OK: actor loop intact, registry "
+                    "intact, Phase 4.5 contract responsive."
+                ),
+            },
+        )
+
+    SYNTHETIC_SCHEMA = {
+        "type": "function",
+        "function": {
+            "name": SYNTHETIC_TOOL_NAME,
+            "description": (
+                "Run a quick self-health check on Betty's actor loop. "
+                "Returns a one-sentence summary of system health. Takes "
+                "no arguments. Use when the user asks for a system "
+                "health check or self-check."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    class _ExplosiveJudge:
+        """MockJudge that raises if before_tool_call is ever called.
+
+        Proves the read_only Judge-skip is structural: if the actor
+        accidentally routes a read_only envelope through the Judge,
+        this raises and the test fails loudly.
+        """
+
+        def reset_turn(self) -> None:
+            pass
+
+        @property
+        def rejections_this_turn(self) -> int:
+            return 0
+
+        def before_tool_call(self, envelope: Envelope, user_request: str) -> JudgeVerdict:
+            raise AssertionError(
+                f"Judge.before_tool_call invoked on read_only envelope! "
+                f"risk_class={envelope.risk_class!r} tool={envelope.tool_call.tool_name!r}. "
+                f"Phase 4.5 Decision C requires Judge-skip for read_only."
+            )
+
+    # Register the synthetic tool. Use the same ToolEntry shape the real
+    # registry uses so the actor sees no difference.
+    from betty_claw.tools import ToolEntry
+    TOOLS[SYNTHETIC_TOOL_NAME] = ToolEntry(
+        callable=_synthetic_read_only_tool,
+        schema=SYNTHETIC_SCHEMA,
+        risk_class="read_only",
+    )
+
+    try:
+        explosive = _ExplosiveJudge()
+        turn = actor_turn(
+            user_message=(
+                "Please run the betty_self_check tool to confirm Betty's "
+                "actor loop is healthy. Just call the tool with no arguments."
+            ),
+            judge=explosive,
+        )
+        print(f"  outcome={turn.outcome}")
+        print(f"  iterations={turn.iterations}")
+        print(f"  judge_verdicts={len(turn.judge_verdicts)}")
+        print(f"  response: {turn.response[:200]!r}")
+
+        # The actor must NOT have routed through the Judge.
+        assert turn.outcome == "tool_read_only", (
+            f"expected tool_read_only outcome, got {turn.outcome!r}. "
+            f"response={turn.response[:300]!r}"
+        )
+        # No Judge verdicts should be recorded for read_only path.
+        assert turn.judge_verdicts == [], (
+            f"read_only path should produce zero verdicts, "
+            f"got {len(turn.judge_verdicts)}: {turn.judge_verdicts}"
+        )
+        # The user-facing response should surface the tool's summary.
+        assert "Betty self-check OK" in turn.response, (
+            f"response should include tool summary; "
+            f"got {turn.response[:300]!r}"
+        )
+        print("  [ok] read_only tool executed, Judge skipped, summary surfaced\n")
+
+    finally:
+        # Always remove the synthetic tool from the registry so we don't
+        # pollute downstream consumers in the same Python session.
+        TOOLS.pop(SYNTHETIC_TOOL_NAME, None)
 
     print("actor.py self-test PASSED")
 

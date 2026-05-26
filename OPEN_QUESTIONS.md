@@ -103,3 +103,77 @@ _None yet — this section will grow as questions get answered._
   individual review. Real test of the proposal-then-approve loop
   against a non-trivial filesystem action.
 
+
+## Phase 4.4 scoping deferrals (locked 2026-05-24, paid down post-win)
+
+Each item below was scoped, considered, and deliberately deferred during
+the Phase 4.4 v2 scoping chat to keep Phase 4.5 + 4.6 narrow enough to
+ship the travelpec.com autonomous-deploy milestone. References:
+`phases/phase-4.4-scoping-kickoff-v2.md`, `phases/phase-4.4-scoping-decisions.md`,
+`phases/phase-4.5-4.6-execution-kickoff.md`.
+
+- **Operator Review UI (Q4, Q5).** Dual-button "Approve Action" vs
+  "Promote to Rule" governance pattern. Was Phase 4.7. Deferred until
+  after travelpec.com deploys — Phase 4.6 uses git revert as the
+  rollback mechanism instead of pre-execute human review. Pick back up
+  when a second executor or a class of tools genuinely benefits from
+  human-in-the-loop.
+
+- **HEARTBEAT.md + launchd autonomous trigger loop (was Phase 4.8).**
+  The scheduled-task autonomy layer. Travelpec.com deploy is triggered
+  by Peter starting an overnight run, not by Betty's own heartbeat.
+  Heartbeat-driven action scoping was specifically flagged in the
+  Q1 operational-boundary discussion as the right place for "real-time
+  site adjustments based on test data."
+
+- **Generalized universal dispatcher abstraction (Q2).** Pulling the
+  "construct envelope, branch on risk_class" logic out of `actor.py`
+  into a dedicated dispatcher module. Phase 4.5 keeps it inline; clean
+  enough at one executor. Revisit when the same logic needs to live in
+  more than one call site.
+
+- **Async / parallel tool execution (Q3).** Phase 4.5 inner loop is
+  strictly serial — one tool call per iteration. The travelpec.com
+  build naturally serializes (one file write at a time, one commit, one
+  push). Async-multiple-tool-call-per-response is a Stage 5+ concern
+  per actor.py docstring.
+
+- **`judge_decisions` table fields beyond the minimum (Q6 advanced).**
+  Phase 4.5 minimum: call_id, tool_name, risk_class, envelope_json,
+  verdict, cost_usd, reasoning, executed_at, execution_result. Future
+  fields likely needed: linked_memory_refs, escalation_status,
+  operator_review_outcome, derived_rules. Add when the operator UI
+  starts consuming the table.
+
+- **Authorization envelope sub-decision (Q1 deferred).** Who populates
+  `authorization_refs` — the actor (semantic, from prior conversation)
+  or the adapter (mechanical, from a separate authorization store)?
+  Genuinely contested. Phase 4.5 ships `authorization_refs: list[str]`
+  as a forward-compatible empty-list field with no validation. Semantic
+  enforcement is post-win work.
+
+- **Authorization-freshness handling (Littlebird's slow-burn concern).**
+  How does an `authorization_refs` value know it's still current? Email
+  context from a week ago might no longer be valid authorization for a
+  payment action today. Real concern. Not addressable until the
+  authorization sub-decision lands.
+
+- **Second-executor stress test (Q9).** Phase 4.9 was originally
+  `send_client_email` as the high-rigor Judge-gated executor that
+  validates the dispatcher across maximally different risk classes.
+  Travelpec.com's tool surface (read_only + reversible_write +
+  external_side_effect via `git_push`) exercises all three risk classes
+  in one run, so a second executor is no longer architecturally
+  necessary — it becomes a "scale to the next site" follow-on.
+
+- **Markdown OS spec completion (Q8).** SOUL.md, IDENTITY.md, TOOLS.md,
+  SKILL.md, HEARTBEAT.md. Phase 4.5+4.6 use only AGENTS, USER, MEMORY.
+  Add the rest when an executor needs them (e.g., SKILL.md routing
+  when the tool surface grows past one-domain-per-tool).
+
+- **`.emlx` ETL, SKILL.md routing, OpenBrain recall in betty_claw.**
+  None of these load-bear for travelpec.com deploy. The substrate
+  retrieval used by `actor.py` already pulls relevant context via the
+  Stage 3 pipeline; the kickoff explicitly notes that spec-completeness
+  work in these areas should defer to documented nulls.
+
