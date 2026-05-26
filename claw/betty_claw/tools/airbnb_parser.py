@@ -139,6 +139,12 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     the block between the first `---\\n` line and the next `---\\n` line.
     If no frontmatter is present, returns ({}, text).
 
+    Handles flat key:value pairs plus lists (key: with `- item` lines
+    on subsequent lines). When a key with empty value is followed by
+    list items, the value gets promoted from "" to [] on the first
+    list item. A key with empty value and no following list items
+    stays as "".
+
     Raises ValueError if the frontmatter is malformed (e.g., opening
     `---` with no closing).
     """
@@ -162,89 +168,42 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     body_lines = lines[close_idx + 1:]
     body = "\n".join(body_lines)
 
-    # Parse the frontmatter lines into a dict, handling lists.
     fm: dict[str, Any] = {}
     current_list_key: str | None = None
 
     for raw_line in frontmatter_lines:
-        # List item under the current key.
+        if raw_line.strip() == "" or raw_line.lstrip().startswith("#"):
+            continue
+
+        # List item under the current key — promote str→list on first hit.
         list_match = _LIST_ITEM_RE.match(raw_line)
         if list_match and current_list_key is not None:
             value = _coerce_scalar(list_match.group(1).strip())
+            if not isinstance(fm[current_list_key], list):
+                fm[current_list_key] = []
             fm[current_list_key].append(value)
             continue
 
-        # Top-level key:value (might also open a list).
+        # Top-level key:value
         kv_match = _KEY_VALUE_RE.match(raw_line)
         if not kv_match:
-            # Blank line or comment — skip.
-            if raw_line.strip() == "" or raw_line.lstrip().startswith("#"):
-                continue
-            # Unknown shape — also skip for robustness.
             continue
 
         key = kv_match.group(1)
         raw_value = kv_match.group(2).rstrip()
 
         if raw_value == "":
-            # Could be an empty value, or the start of a nested
-            # structure (list with `- ` items on subsequent lines).
-            # We don't know yet; treat as empty-string for now and
-            # promote to list when the next list item arrives.
+            # Empty value — could be an empty string field (e.g.
+            # price_per_night:) or the opening of a list (e.g. images:
+            # followed by `- url`). Set to "" for now; list items on
+            # subsequent lines promote it to a list.
             fm[key] = ""
             current_list_key = key
         else:
             fm[key] = _coerce_scalar(raw_value)
             current_list_key = None
 
-        # If the next non-blank line is a list item under this key,
-        # convert the value to a list before adding items.
-        # (Handled lazily — when we see the first list item, we
-        # check if the field is currently a string-or-empty and
-        # promote it to a list.)
-
-    # Promote list-keys whose value is still an empty string to []
-    # (no list items appeared after them).
-    for key, value in list(fm.items()):
-        if value == "" and key == current_list_key:
-            fm[key] = []
-
-    # Second pass for list promotion that happened during parsing.
-    # (Our single-pass logic above already promoted by appending,
-    # but the initial value was set to ""; rewind by detecting
-    # the case where current_list_key was set and items followed.)
-    # Simplified version: re-parse list-keys directly.
-    for key, value in list(fm.items()):
-        if value == "" and any(
-            _LIST_ITEM_RE.match(line)
-            for line in frontmatter_lines[
-                _find_key_line(frontmatter_lines, key) + 1:
-            ]
-            if line.strip() != ""
-            and not _KEY_VALUE_RE.match(line)
-        ):
-            # Collect list items belonging to this key.
-            items = []
-            start = _find_key_line(frontmatter_lines, key) + 1
-            for j in range(start, len(frontmatter_lines)):
-                line = frontmatter_lines[j]
-                if _KEY_VALUE_RE.match(line):
-                    break
-                m = _LIST_ITEM_RE.match(line)
-                if m:
-                    items.append(_coerce_scalar(m.group(1).strip()))
-            fm[key] = items
-
     return fm, body
-
-
-def _find_key_line(lines: list[str], key: str) -> int:
-    """Return the index of the first line matching `key:` in `lines`."""
-    pattern = re.compile(rf"^{re.escape(key)}:\s*")
-    for i, line in enumerate(lines):
-        if pattern.match(line):
-            return i
-    return -1
 
 
 # ---------------------------------------------------------------------------
