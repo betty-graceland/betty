@@ -1677,3 +1677,256 @@ If the smoke test passes, substage (c) closes. Phase 4.6.1 then
 implements the dossier parser. After that, the first real
 content-population overnight: 35 Airbnb dossiers → 35 draft Stays
 entries → human review of the diff → publish.
+
+
+## Phase 4.6 substage (c) closed — smoke test green, end-to-end chain proven
+
+Commits: `63cf030` (schema DDL tools for smoke test T01), `5aff4a7`
+(smoke test runner module), `84d230b` (actor.py proposal_path KeyError
+fix), plus the substage (c) closure commit landing this entry.
+
+The BRIEF's Phase 0 smoke test ran green on 2026-05-26 at 09:08 UTC:
+T01a (emdash_create_collection) + T01b (emdash_create_field) + T02
+(write_file) — three sequential `actor_turn` calls, three Judge
+approvals on first iteration each, total Anthropic spend $0.0563.
+The proof goals from the BRIEF — orchestrator → Qwen → MCP write
+path, orchestrator → Qwen → filesystem write path — are both
+satisfied end-to-end on real infrastructure.
+
+This is the win Phase 4.4 scoped toward. Betty (the current
+rebuilt architecture: Qwen actor + Opus Judge + per-tool risk_class
++ envelope contract) autonomously planned and executed a tool
+chain against real EmDash CMS state and real filesystem, with the
+Judge gating each non-read action and writing audit rows to
+`judge_decisions`. The architecture is no longer a paper design;
+it's a runtime that did work.
+
+### What landed (substage (c) specifically)
+
+- **Two new schema DDL tools** in `claw/betty_claw/tools/emdash_writes.py`:
+  - `emdash_create_collection` (reversible_write) — wraps MCP
+    `schema_create_collection`. Validates slug pattern
+    `^[a-z][a-z0-9_]*$`, supports enum, label/description as strings.
+  - `emdash_create_field` (reversible_write) — wraps MCP
+    `schema_create_field`. Validates the 14-value field type enum,
+    slug pattern, optional validation dict pass-through.
+  Both registered in `tools/__init__.py`; registry now holds 21
+  tools.
+
+- **Smoke test runner** at `claw/betty_claw/smoke_test.py` (319 lines).
+  Self-contained `run_smoke_test()` function that exercises T01a +
+  T01b + T02 as three sequential `actor_turn` calls, tracks
+  cumulative Anthropic spend, verifies the marker file on disk
+  after T02, exits 0 on full pass / 1 on any failure. Includes
+  step-skip logic (T01b depends on T01a's collection existing) and
+  diagnostic output for failure modes. Reusable for future smoke
+  tests by parameterizing the marker filename.
+
+- **`actor.py` bug fix.** The Judge-approved branch in `actor_turn`
+  hard-coded `tool_result.payload["proposal_path"]` — a Phase 4.3
+  assumption from when `draft_email` was the only registered tool
+  and every approval surfaced a proposal file path. Phase 4.6's
+  emdash_* / write_file / git_* tools don't write proposal files;
+  they execute their action and surface a `summary` string instead.
+  The KeyError was caught on the first smoke test run (T01a). Fix:
+  extract `proposal_path` and `summary` both with `.get()`,
+  generalize `_synthesize_approval_response` to prefer summary,
+  fall back to proposal-path pattern, fall back to a generic
+  "completed" message.
+
+### Verified live
+
+Smoke test output, 2026-05-26 09:08 UTC, paraphrased from the
+runner's log lines:
+
+  - **T01a** — Qwen called `emdash_create_collection({slug: "smoketest",
+    label: "Smoke Test"})`, 1 iteration, Judge approved with cost
+    $0.0175. Judge reasoning: *"The tool call exactly matches the
+    user's explicit request with the specified arguments and no
+    extras. The action is a reversible write and clearly authorized."*
+    Server confirmed the collection exists via subsequent admin-UI
+    verification.
+
+  - **T01b** — Qwen called `emdash_create_field({collection:
+    "smoketest", slug: "note", label: "Note", type: "text"})`, 1
+    iteration, Judge approved with cost $0.0188. Judge reasoning:
+    *"The proposed tool call exactly matches the user's explicit
+    smoke test instructions with the specified arguments and no
+    extras. The action is a reversible write to a clearly-named
+    test collection."*
+
+  - **T02** — Qwen called `write_file({path:
+    "/Users/betty/Projects/emdash/travelpec-site/src/smoketest_marker.txt",
+    content: "Smoke test 2026-05-26T09:08:28.309180+00:00\n"})`,
+    1 iteration, Judge approved with cost $0.0200. Marker file
+    verified on disk at 44 bytes after the call returned. Judge
+    reasoning: *"The proposed call exactly matches the user's
+    explicit smoke test instructions: correct tool, exact path,
+    exact content, no extra arguments. The write is reversible
+    and explicitly requested."*
+
+  - **Total** — 3/3 steps passed, $0.0563 Anthropic spend, no
+    iteration loops needed (Qwen got each call right on the first
+    attempt).
+
+After the run, Peter manually verified:
+
+  1. The `smoketest` collection visible in the EmDash admin UI
+     content list (note: the `note` field is in the schema view,
+     not the content view — fields are column-level, not row-level).
+  2. The marker file at
+     `/Users/betty/Projects/emdash/travelpec-site/src/smoketest_marker.txt`
+     exists with the expected timestamp content (44 bytes).
+  3. A `vic-overnight-test` branch created locally on the
+     travelpec-site repo, the marker file committed, and the
+     branch pushed to `github.com:betty-graceland/travelpec-com.git`.
+     (NB: local working dir is `travelpec-site`, remote repo is
+     `travelpec-com` — naming mismatch that's been in place since
+     v2 and is being preserved for stability.)
+
+### Locked decisions (carry forward)
+
+- **The smoke test is a runnable module, not a one-shot script.**
+  `python -m betty_claw.smoke_test` runs it. Future smoke tests
+  (Phase 4.6.2+ when expanding to content population) follow the
+  same pattern: a runnable module with sequential `actor_turn`
+  calls, cost tracking, on-disk verification.
+
+- **`smoketest` collection lingers across runs unless deleted.**
+  The smoke test isn't idempotent — re-running after a previous
+  successful T01a will hit `[COLLECTION_EXISTS]` from EmDash. To
+  re-run cleanly, delete via the admin UI OR via the one-off
+  MCP curl pattern logged in this entry's Incidents section.
+
+- **Tool response synthesis prefers `summary` over `proposal_path`.**
+  The `_synthesize_approval_response` generalization is the new
+  norm. New tools should set `summary` in their result payload;
+  `proposal_path` remains the special case for `draft_email`-style
+  proposal-file tools.
+
+- **Autonomous `git_push` graduates separately.** Substage (c)
+  validated MCP and filesystem writes; the `git_push` path stays
+  manual until the next round of smoke tests covers it on a
+  sacrificial repo or branch. Phase 4.6.2 candidate work.
+
+### Incidents
+
+**Smoke test's first attempt crashed on `proposal_path` KeyError
+in actor.py.** T01a's tool dispatched successfully (collection got
+created server-side), but the actor's response-synthesis path
+hard-coded `payload["proposal_path"]` which only `draft_email`
+provides. KeyError raised. The crash was downstream of the tool
+execution, so EmDash retained the half-created `smoketest`
+collection (no fields yet). Fix landed as `84d230b`; re-run
+proceeded but hit a state-collision (next incident).
+
+**State collision on smoke test re-run after fix.** After the
+KeyError fix, re-running the smoke test hit
+`MCP error -32000: [COLLECTION_EXISTS]` on T01a — the partially-
+created `smoketest` collection from the crashed first attempt
+collided with the new create attempt. Qwen handled this gracefully
+(emitted a clean text explanation rather than crashing or
+breaker-tripping), but the script reported T01a as "outcome=text,
+not tool_approved" which is the correct strict-semantics failure.
+Recovery: one-off `curl` to the EmDash MCP's `schema_delete_collection`
+endpoint (the tool isn't in betty_claw's registry per Q1 Decision
+A — narrow tool surface — but the MCP endpoint exists and is
+reachable directly for admin operations). After deletion, the
+re-run hit 3/3 cleanly.
+
+**Comment-in-shell paste broke a `git checkout -` command.**
+A trailing `# return to previous branch` comment in the cleanup
+command block got interpreted by zsh as command arguments,
+producing `error: pathspec '#' did not match any file(s) known
+to git`. Same recurring incident — hand-off-instructions side,
+not codebase. The discipline is reinforced again: shell command
+blocks for Peter should contain executable lines only; explanations
+go outside the code block.
+
+**Token export doesn't persist across new terminal sessions.**
+After a fresh terminal session, `EMDASH_TOKEN` wasn't set, so the
+delete curl returned empty SSE output ("Expecting value: line 1
+column 1"). Resolved by re-running
+`export EMDASH_TOKEN="$(cat ~/Desktop/vic-token.txt)"` in the
+current shell before the curl. The smoke test itself doesn't have
+this problem — it loads `EMDASH_TOKEN` from `.env` via dotenv at
+module init, so the env-export step is only needed for one-off
+shell `curl` commands.
+
+**Second deleted-token false alarm.** Peter mentioned recovering a
+second token file (`cf-token.txt`) and wondered if it was the
+blocking issue. `cf-token.txt` is the Cloudflare API token (used
+by `wrangler` for deploys), distinct from `vic-token.txt` (EmDash
+MCP). Not related to the smoke test failure. Good to have it
+restored anyway; will matter when Phase 4.7+ touches Cloudflare
+auth directly.
+
+**`smoketest` collection persists post-test.** No automatic
+cleanup. Peter (or a future cleanup script) needs to delete the
+collection from EmDash admin UI between runs. Logged in operator
+notes below.
+
+### Deferred items
+
+- **Phase 4.6.1: Airbnb dossier parser.** Builds against a real
+  dossier sample (paste pending from
+  `~/My Drive/Betty/emdash-sites/travelpec.com-v3/01-source-data/research/airbnb-listings/`).
+  Maps title/persona/bedrooms/capacity/outbound_url to Stays
+  schema; image placeholders only; `is_advertised=0` default per
+  the locked decision.
+
+- **Phase 4.6.2: autonomous `git_push`** as part of an expanded
+  smoke test. T01 + T02 + auto-commit + auto-push to
+  `vic-overnight-test` (NOT live `vic-overnight`). Validates the
+  full external_side_effect path. Pre-requisite: the smoke test
+  runner needs to switch to `vic-overnight-test` before T02 and
+  the git_push tool — the current Phase 4.6 git_push hard-codes
+  remote branch to `vic-overnight`, not `vic-overnight-test`, so
+  either the smoke test pushes to live vic-overnight or we
+  introduce a test-specific override before running.
+
+- **Smoke test idempotency.** Currently re-running after success
+  produces a collision. Future work: either (a) parametrize the
+  collection slug with a timestamp suffix, (b) add an explicit
+  cleanup step at the start that deletes any existing `smoketest`
+  collection, or (c) treat `COLLECTION_EXISTS` on T01a as soft-pass
+  with a "[skip] already created" message. (a) or (b) are honest;
+  (c) hides real failures. Pick (a) or (b) when this becomes a
+  recurring annoyance.
+
+- **Operator review UI.** Still deferred from Phase 4.4 (was
+  Phase 4.7). Substage (c) just validated that the architecture
+  works without a UI — Peter ran the smoke test from a shell and
+  eyeballed the admin UI and the disk. A web UI for reviewing
+  Betty's overnight runs becomes a quality-of-life upgrade rather
+  than a blocker.
+
+### Operator notes
+
+Carried forward, with two additions:
+
+- **EmDash admin UI URL** is `https://travelpec.com/_emdash/admin`
+  (auth via the same OAuth flow the rest of the site uses). The
+  Schema view shows collection field definitions; the Content view
+  shows item rows. Don't expect to see field names in the Content
+  view — that's where rows live.
+
+- **The smoke test runner can be invoked anytime via
+  `uv run python -m betty_claw.smoke_test`**. The current scope
+  creates a `smoketest` collection, an Astro source marker, and a
+  judge_decisions audit trail. Between runs, delete the
+  `smoketest` collection via admin UI (or the curl pattern in the
+  Incidents section above) to avoid the collision.
+
+### Phase 4.6 sealed
+
+Substages (a), (b), and (c) all closed. The launch-milestone
+architecture from the v2 scoping kickoff is now demonstrably
+working on real infrastructure. The follow-on phases (4.6.1
+dossier parser, 4.6.2 autonomous git_push, then full
+content-population overnights for the 35 Airbnb dossiers + the
+remaining article and itinerary research) build on this proven
+chain. The deferred items from Phase 4.4 scoping (UI, HEARTBEAT,
+second executor, authorization freshness, dispatcher abstraction)
+remain deferred — the win was the architecture itself running
+end-to-end, and we got that without paying their costs.
