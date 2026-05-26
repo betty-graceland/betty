@@ -127,7 +127,10 @@ class ActorTurn:
     """One turn through the actor: user input in, response and trace out.
 
     Phase 4.3 adds outcome/proposal_path/judge_verdicts/iterations
-    fields with defaults. Stage 3 callers see the same shape as before
+    fields with defaults. Phase 4.6.2 adds `tool_result` so multi-turn
+    runners (single_dossier_test, future bulk-content orchestrators)
+    can extract structured data from one turn and pass it forward into
+    the next turn's prompt. Stage 3 callers see the same shape as before
     plus default-value additions.
     """
     user_message: str
@@ -139,6 +142,10 @@ class ActorTurn:
     proposal_path: str | None = None
     judge_verdicts: list[JudgeVerdict] = field(default_factory=list)
     iterations: int = 1
+    # Phase 4.6.2 addition: the ToolResult from the dispatched tool, if any.
+    # Populated for outcome="tool_approved" and outcome="tool_read_only".
+    # None for text turns and short-circuit terminal states.
+    tool_result: ToolResult | None = None
 
     @property
     def latency_seconds(self) -> float:
@@ -491,6 +498,7 @@ def actor_turn(
                     outcome="tool_read_only",
                     judge_verdicts=verdicts,
                     iterations=iteration,
+                    tool_result=tool_result,
                 )
 
             # Non-read_only: existing Judge path. The Judge sees the
@@ -529,6 +537,7 @@ def actor_turn(
                     proposal_path=proposal_path,
                     judge_verdicts=verdicts,
                     iterations=iteration,
+                    tool_result=tool_result,
                 )
 
             # Reject. Structural branch on cost_usd == 0.0:
