@@ -90,6 +90,10 @@ from betty_claw.tools.emdash_writes import (
     emdash_unpublish_content,
     emdash_update_content_draft,
 )
+from betty_claw.tools.airbnb_parser import (
+    PARSE_AIRBNB_DOSSIER_SCHEMA,
+    parse_airbnb_dossier,
+)
 
 from betty_claw.contracts import RiskClass, ToolResult
 
@@ -253,6 +257,17 @@ TOOLS: dict[str, ToolEntry] = {
         callable=emdash_publish_content,
         schema=EMDASH_PUBLISH_CONTENT_SCHEMA,
         risk_class="external_side_effect",
+    ),
+
+    # ----- Phase 4.6.1: domain-specific parser tools -----
+    # parse_airbnb_dossier reads a research dossier (YAML frontmatter +
+    # markdown body) and returns a Stays-compatible dict. read_only —
+    # no MCP calls, no filesystem writes. Bridges the 35 scraped Airbnb
+    # dossiers into the content-population pipeline.
+    "parse_airbnb_dossier": ToolEntry(
+        callable=parse_airbnb_dossier,
+        schema=PARSE_AIRBNB_DOSSIER_SCHEMA,
+        risk_class="read_only",
     ),
 }
 
