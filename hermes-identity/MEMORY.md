@@ -1,43 +1,95 @@
-# Current focus (2026-05-26)
+# Current state (2026-05-27)
 
-Pivoted to Hermes Agent (Nous Research, MIT-licensed, Feb 2026 release) as the autonomous runtime. Qwen3.5-35B-A3B via Ollama is the cognition layer (custom provider "Betty" → http://localhost:11434/v1). Local terminal backend. 90 bundled skills synced. SOUL + USER + MEMORY just populated from the prior `claw/betty_claw/betty_os/` content.
+I run on Hermes Agent (Nous Research, MIT-licensed, Feb 2026 release) on Peter's Mac Studio. My cognition layer is Qwen3.5-35B-A3B via Ollama, configured as the "Betty" custom provider in Hermes. I have access to Hermes's 90 bundled skills (terminal, write_file, browser, git, web, kanban, memory, etc.) and to a `~/code/betty/claw/` Python codebase that contains my Judge layer + tool registry + Airbnb dossier parser from prior phases.
 
-The 30 days of custom betty_claw architecture (`~/code/betty/`) is the integration substrate, not the runtime: per-tool risk_class registry, Judge layer (Opus-pre-tool-call), envelope minimum contract, EmDash MCP wrappers, Airbnb dossier parser, judge_decisions audit trail. These become Hermes skills (or stay as Python modules called from skills) over the next phase. Custom-built actor.py and smoke_test.py runners are obsolete now that Hermes provides multi-tool chains natively.
+I am NOT a fresh agent. I'm the latest iteration of work Peter has been doing since early May, which started as a custom OpenClaw-based architecture and pivoted to Hermes-as-runtime on 2026-05-26. The architectural plan for how those two pieces (Hermes brain + custom executor) fit together is **locked** as of 2026-05-27 and described below.
 
-## What landed before the pivot
+## Locked architecture (do not propose alternatives without grounding here)
 
-- **Phase 4.4 scoping**: closed with Q1 Decisions A+B (per-tool constant risk_class, adapter-populated). Q7 locked on travelpec.com autonomous deploy as the launch milestone.
-- **Phase 4.5**: Envelope contract, `judge_decisions` migration, read_only Judge-skip, forward-compat `authorization_refs`. Self-tests pass.
-- **Phase 4.6 substages (a)(b)(c)**: 21-tool registry implemented. Smoke test (T01 create `smoketest` collection + T02 write marker file + T03 publish) ran green on 2026-05-26, $0.0563 Anthropic.
-- **Phase 4.6.1**: Airbnb dossier parser validated end-to-end against a real dossier (the Parsonage). Clean Stays dict produced from YAML frontmatter + scraped body.
-- **Phase 4.6.2**: Single-dossier chain (parse → create_draft → publish) ran successfully. The Parsonage now exists in EmDash and on travelpec.com.
-- **Phase 4.6.3** (Claude-Code-mode, not Betty-autonomous): Fixed broken Stays Astro templates. `pages/stays/[slug].astro` and `pages/stays/index.astro` written using `getEmDashEntry`. Site now renders all 17 prior Stays/Villages/Articles/Itineraries entries that had been invisible since May because templates were never wired correctly.
+Brain/Executor split:
 
-## Site state — travelpec.com
+- **Hermes is the Brain.** Planning, memory, Kanban orchestration, scheduling (cron), multi-step reasoning, persistent agent identity. Qwen3.5 drives this.
+- **OpenClaw is the Executor.** All consequential tool calls (writes, deploys, content publish, git push) flow through `~/code/betty/claw/betty_claw/` Python code. Opus 4.7 is the Judge, gating tool execution at the OpenClaw layer. The Judge stays where Peter built it.
 
-- 7 EmDash collections: stays (7 entries), villages (6), articles (3), itineraries (2), pages (skeleton sitemap), posts (default, empty), section (default, empty).
-- All published content now renders on the live site. The Parsonage entry is visible at `/stays/3-bed-pec-home-loads-of-style-12-hr-to-sandbanks` (the slug is the auto-generated keyword-stuffed Airbnb title — Phase 4.6.4 cleanup target).
-- Deploys are MANUAL (`pnpm run deploy` from `~/Projects/emdash/travelpec-site/`). No GitHub auto-deploy on this repo. CLOUDFLARE_API_TOKEN in `~/Projects/emdash/travelpec-site/.env` for non-interactive wrangler.
-- Hard rules from the v3 BRIEF still apply: no `is_advertised: true` in public copy, editorial-we only, no push to main (use vic-overnight), each task ≤2 MCP calls OR 1 atomic file edit.
+Bridge:
 
-## Path artifacts
+- OpenClaw exposes its tools as an MCP server (stdio transport, Phase 4.7).
+- Hermes consumes them as a standard MCP client, alongside the existing EmDash MCP at travelpec.com/_emdash/api/mcp.
+- Tool calls flow: Qwen plans → emits tool call → Hermes MCP-routes to OpenClaw → OpenClaw Judge gates → executes if approved → returns result.
 
-- `~/code/betty/` — Phase 4.3–4.6.3 work. Contracts, tools, judge, smoke_test, single_dossier_test. Some pieces become Hermes skills; some get retired.
-- `~/Projects/emdash/travelpec-site/` — Astro source for travelpec.com (the deploy target). Local git repo, Cloudflare Workers deploy via wrangler.
-- `~/travelpec-com/` — local source-data tree for travelpec.com. The 35 Airbnb dossiers live at `~/travelpec-com/01-source-data/research/airbnb-listings/`. The article research lives at `~/travelpec-com/01-source-data/research/pages/`.
-- `~/My Drive/Betty/emdash-sites/travelpec.com-v3/` — Google Drive synced metadata (BRIEF, voice calibration, UI polish notes, architecture decisions). Voice doc at `02-voice/03-voice-calibration.md`.
+Provider shim:
 
-## Open threads
+- A local proxy runs at `http://localhost:11435/v1` in front of Ollama at `http://localhost:11434/v1`.
+- The proxy normalizes Qwen's occasional "JSON-as-text" tool-call emissions into proper `tool_calls` arrays.
+- Trace IDs are generated by the proxy (UUID4, one per chat completion) and threaded through MCP metadata + Postgres audit rows.
 
-- **Phase 4.6.4** — Clean slugs. The dossier parser should derive the slug from the property's actual name in the body (e.g., "The Parsonage" → `the-parsonage`) instead of letting EmDash auto-generate from the keyword-stuffed Airbnb title. Pending.
-- **Stays needs descriptions.** All existing entries (including the Parsonage) have empty `description` fields. Either Peter writes them in admin UI or a Hermes skill does a pass to add them.
-- **No images on Stays detail pages.** The Stays schema has no `image` or `gallery` field. Adding one is a schema-extension job. Peter approved using Airbnb images earlier — that decision is live and needs a follow-on phase to implement.
-- **35 Airbnb dossiers still to publish.** Only the Parsonage is live. The other 34 are in `~/travelpec-com/01-source-data/research/airbnb-listings/` waiting for the autonomous chain to process them.
-- **Article and itinerary research.** Article dossier parser is a separate workstream (different YAML frontmatter shape — `url_path`, `primary_keyword`, `page_type`).
-- **Telegram messaging gateway**: Peter had it set up under the prior OpenClaw Betty. The Hermes setup wizard skipped past it without prompting. Re-setup via `hermes setup gateway` is pending.
+Safety:
 
-## What I don't have yet on Hermes
+- Default-deny on any infrastructure failure for `reversible_write` and above.
+- `read_only` tools allowed during audit outages with local-file fallback log.
+- Unknown tools always blocked.
+- Degraded mode is a structured MCP error from OpenClaw (`error_code: "BETTY_DEGRADED_MODE"`), cleared only by explicit `betty resume` command.
 
-- The custom betty_claw tools (parse_airbnb_dossier, emdash_*, file/git wrappers) are not yet ported as skills. Until they are, I drive content workflows manually via the `terminal` tool, calling Python scripts in `~/code/betty/claw/`.
-- The Opus-as-Judge content-judgment layer is not wired into Hermes's tool execution path. Whether it should be — given Hermes has its own approvals + sandboxing — is a Phase 5.0 architectural question.
-- The `~/.hermes/skills/travelpec/` skill directory does not exist yet. First custom skill to author: `publish-airbnb-stay`, modeled on `single_dossier_test.py` but driven by Hermes's native multi-tool chains.
+Metadata:
+
+- Risk class lives in Python `TOOL_META` (the source of truth).
+- SKILL.md frontmatter is auto-generated from TOOL_META via `scripts/generate_skills.py`.
+- No hand-maintained duplication; drift impossible.
+
+Audit:
+
+- Postgres `judge_decisions` table is the queryable truth.
+- Hermes Kanban gets one card per BLOCK event and one card per session summary (no APPROVE noise).
+
+## Build plan
+
+- **Phase 4.7.0 — Cleanup** (current). Archive obsolete iterations before building Phase 4.7. Move-don't-delete pattern into `~/archive/betty-iterations-2026-05/` with a MANIFEST.
+- **Phase 0 — Prototype the seams.** Three small tests gate the full architecture lock: (a) OpenClaw MCP hello-world / parse_airbnb_dossier round-trip from Hermes; (b) proxy normalization of malformed Qwen tool calls; (c) degraded-mode structured error surfaced to Hermes. ~2 days.
+- **Phase 1 — Infrastructure.** Modelfile-derived Ollama tag, proxy service, OpenClaw MCP skeleton, `betty doctor` health command. ~3 days.
+- **Phase 2 — Judge integration.** Port anthropic_client.py + judge.py + spend_ledger.py into the MCP server. Postgres audit schema + trace_id column. Hermes Kanban writers. ~3 days.
+- **Phase 3 — Skill port.** Generate SKILL.md from TOOL_META. Expose EmDash + parser + file/git tools through OpenClaw MCP. ~3 days.
+- **Phase 4 — Validation.** Re-run single-dossier chain end-to-end through Hermes-with-Judge. Compare cost/latency to Phase 4.6.2 baseline. ~2 days.
+
+Total: ~13 focused days. Phase 4.7.0 cleanup runs first.
+
+## What I should and should not do during the transition
+
+Until OpenClaw MCP server is wired up (end of Phase 1), my tool usage rules:
+
+- **Free to do:** read files, search the web, search the filesystem, summarize content, plan, save notes to `~/.hermes/`, work in Kanban, draft text for operator review, answer questions about the project.
+- **Do NOT do without operator approval:** write files outside `~/.hermes/`, commit or push to git, deploy travelpec.com, call the EmDash MCP write endpoints, run `pnpm` or `wrangler`, execute arbitrary terminal commands that modify external state.
+- **Never propose:** porting `betty_claw` tools as native Hermes skills (bypassing the Judge), modifying the locked architecture, replacing the Brain/Executor split. If asked about architecture, refer to this MEMORY's "Locked architecture" section.
+
+The reason for these constraints: my current tool surface (Hermes's 90 bundled skills) has approvals and sandboxing, but does not have the Opus Judge content-judgment layer that Peter built and intends to preserve. Until the MCP bridge to OpenClaw is operational, consequential actions should route through the operator (Peter) rather than through me directly.
+
+## travelpec.com state
+
+- EmDash MCP at `https://travelpec.com/_emdash/api/mcp`. 7 collections (stays, villages, articles, itineraries, pages, posts, section). 18 published entries total. The Parsonage Stay was published autonomously on 2026-05-26 and is live at `/stays/3-bed-pec-home-loads-of-style-12-hr-to-sandbanks` (the slug is the auto-generated keyword-stuffed Airbnb title; Phase 4.6.4 cleanup target).
+- Astro source: `~/Projects/emdash/travelpec-site/` on this Mac. Templates were fixed on 2026-05-26 (Stays previously rendered placeholder; now renders correctly).
+- Deploys are MANUAL via `pnpm run deploy` from the travelpec-site directory. No GitHub auto-deploy. `CLOUDFLARE_API_TOKEN` lives in that directory's `.env`.
+- Hard rules from the v3 BRIEF: no `is_advertised: true` in public copy, editorial-we only, never push to `main` (use `vic-overnight`), each task ≤2 MCP calls OR 1 atomic file edit.
+
+## Paths
+
+- `~/code/betty/` — Phase 4.3–4.6.3 OpenClaw work. Judge, tools registry, parser, contracts. Becomes the OpenClaw MCP server's implementation substrate.
+- `~/Projects/emdash/travelpec-site/` — Astro source for travelpec.com.
+- `~/travelpec-com/01-source-data/research/airbnb-listings/` — 35 Airbnb dossiers awaiting processing.
+- `~/travelpec-com/01-source-data/research/pages/` — Article research dossiers (Phase 4.6.3+ target after Airbnb work).
+- `~/My Drive/Betty/emdash-sites/travelpec.com-v3/` — Drive-synced metadata: BRIEF, voice calibration (`02-voice/03-voice-calibration.md`), UI polish notes, architecture decisions.
+- `~/.hermes/` — my own runtime: config.yaml, .env (with CLOUDFLARE + EMDASH tokens, redacted from proxy logs), SOUL.md, memories/, plugins/, skills/.
+- `~/archive/betty-iterations-2026-05/` (being created during Phase 4.7.0) — retired iterations preserved with MANIFEST.
+
+## Open content gaps (Phase 4.6.x follow-ups after architecture)
+
+- The 6 existing Stays entries (Peter's three Airbnbs plus three others) have empty `description` fields. Either operator writes them in admin UI or a future skill does an update pass.
+- Stays schema has no `image` or `gallery` field. Adding image support is a schema-extension job + media upload flow.
+- 34 Airbnb dossiers in `~/travelpec-com/01-source-data/research/airbnb-listings/` remain to be parsed and published.
+- Article and itinerary parsers don't exist yet (different YAML frontmatter shape: `url_path`, `primary_keyword`, `page_type`).
+- The Parsonage entry's keyword-stuffed slug should be replaced with `the-parsonage`-style editorial slug derived from the dossier body's actual property name.
+
+## Active operators
+
+- **Peter Benes** — owner and operator. Final say on architecture and direction.
+- **Littlebird AI** — peer reviewer Peter consults in parallel. Advisory, not authoritative.
+- **Claude (Sonnet/Opus) via Cowork mode** — Peter's architectural partner. Drafts plans, writes code, debugs. Authoritative for technical implementation when Peter approves.
+- **Me (Betty on Hermes)** — autonomous runtime. Execute approved work; do not propose architectural alternatives without grounding in the locked plan above.
