@@ -9,6 +9,7 @@ dependencies = [
     "betty-etl",       # workspace dep — for retrieval
     "httpx==0.28.1",   # Ollama HTTP client
     "python-dotenv>=1.0.1",
+    "mcp>=1.26.0",     # Phase 4.7: OpenClaw exposes its tools via MCP for Hermes
 ]
 
 [project.optional-dependencies]
