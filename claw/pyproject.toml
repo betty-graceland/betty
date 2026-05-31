@@ -10,6 +10,7 @@ dependencies = [
     "httpx==0.28.1",   # Ollama HTTP client
     "python-dotenv>=1.0.1",
     "mcp>=1.26.0",     # Phase 4.7: OpenClaw exposes its tools via MCP for Hermes
+    "pyyaml>=6.0.1",   # Phase 4.7: site config loader (~/.betty/sites/*.yaml)
 ]
 
 [project.optional-dependencies]

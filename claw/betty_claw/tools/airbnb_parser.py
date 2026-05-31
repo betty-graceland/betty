@@ -1,11 +1,21 @@
 """
-Airbnb dossier parser (Phase 4.6.1).
+Airbnb dossier parser (Phase 4.6.1, refactored 2026-05-31 for Pattern B).
 
-Reads a research dossier from BETTY_DOCS_DIR's airbnb-listings/ folder
-and returns a dict shaped to the Stays collection schema. This is the
-tool that bridges the 35 scraped Airbnb dossiers into Betty's
-content-population pipeline: parse → emdash_create_content_draft →
-(human review) → emdash_publish_content.
+Reads an Airbnb research dossier from a site's read-allowed paths and
+returns a dict shaped to that site's Stays collection schema. This is the
+tool that bridges scraped Airbnb dossiers into Betty's content-population
+pipeline: parse → emdash_create_content_draft → (human review) →
+emdash_publish_content.
+
+PATTERN B MULTI-SITE
+====================
+This module is site-agnostic. The MCP server wrapper resolves the active
+site config (~/.betty/sites/{site}.yaml) and passes `allowed_roots` and
+`fixed_fields` as explicit arguments. The parser does NOT read environment
+variables, filesystem globals, or any other ambient state — everything
+that varies per site flows in through the args dict. This makes the same
+parser work for travelpec.com today, lingerieshoppe.com next, and any
+future directory site that ingests Airbnb listings.
 
 DOSSIER SHAPE (observed 2026-05-26 from one sample, presumed uniform
 across the ~35 listings)
@@ -53,12 +63,10 @@ ToolResult payload includes:
 
 HARD RULES ENFORCED
 ===================
-- `provider` is always "airbnb" (the parser is Airbnb-specific).
-- `is_advertised` defaults to 0 per Peter's locked decision
-  (2026-05-26). The three Peter+Amber properties get flipped manually
-  post-build; the parser never sets is_advertised=1.
-- `featured_eligible` defaults to 0; Peter decides featured rotation
-  manually.
+- Site-level invariants (e.g., `provider: airbnb`, `is_advertised: 0`,
+  `featured_eligible: 0`) flow in via the `fixed_fields` arg from the
+  site's parsers.airbnb_dossier.fixed_fields block in YAML. The parser
+  overwrites any value the dossier might claim — site config wins.
 - Images stay as `<!-- IMAGE: ... -->` placeholders in any composed
   content. The parser does not embed actual image URLs in body text.
 - The parser is read_only — no MCP calls, no filesystem writes.
@@ -82,11 +90,7 @@ from typing import Any
 from betty_claw.contracts import ToolResult
 from betty_claw.tools.emdash_reads import _assert_dict_keys, _assert_str
 from betty_claw.tools.emdash_writes import _validate_data_for_collection
-from betty_claw.tools.filesystem import (
-    BETTY_DOCS_DIR,
-    BETTY_RESEARCH_DIR,
-    _validate_path_under,
-)
+from betty_claw.tools.filesystem import _validate_path_under
 
 
 # ---------------------------------------------------------------------------
@@ -385,14 +389,15 @@ PARSE_AIRBNB_DOSSIER_SCHEMA: dict = {
         "description": (
             "Parse one Airbnb research dossier into a Stays-collection-"
             "compatible dict. Reads a markdown file with YAML frontmatter "
-            "from BETTY_DOCS_DIR (the docs/research root). Returns the "
-            "Stays data ready to pass to emdash_create_content_draft, "
-            "plus the raw frontmatter and a cruft-stripped body excerpt "
-            "for Qwen to optionally compose a richer description from. "
-            "Always sets provider='airbnb' and is_advertised=0 — those "
-            "two are not configurable per the locked Phase 4.4 decisions. "
-            "Images are NOT embedded in returned data; they stay as "
-            "placeholder comments at content-write time."
+            "from one of the site's read-allowed roots (passed in by the "
+            "MCP server from ~/.betty/sites/{site}.yaml). Returns the Stays "
+            "data ready to pass to emdash_create_content_draft, plus the "
+            "raw frontmatter and a cruft-stripped body excerpt for Qwen "
+            "to optionally compose a richer description from. Site-level "
+            "fixed_fields (provider, is_advertised, featured_eligible, etc.) "
+            "are merged into the result from the site config; the dossier "
+            "cannot override them. Images are NOT embedded in returned "
+            "data; they stay as placeholder comments at content-write time."
         ),
         "parameters": {
             "type": "object",
@@ -401,9 +406,8 @@ PARSE_AIRBNB_DOSSIER_SCHEMA: dict = {
                     "type": "string",
                     "description": (
                         "Absolute or ~-prefixed path to the dossier .md "
-                        "file. Must resolve under BETTY_DOCS_DIR — "
-                        "dossiers live in 01-source-data/research/"
-                        "airbnb-listings/."
+                        "file. Must resolve under one of the site's read "
+                        "roots (paths.astro / paths.docs / paths.research)."
                     ),
                 },
             },
@@ -414,23 +418,42 @@ PARSE_AIRBNB_DOSSIER_SCHEMA: dict = {
 }
 
 
-def parse_airbnb_dossier(args: dict) -> ToolResult:
-    """Parse one Airbnb dossier. risk_class=read_only."""
+def parse_airbnb_dossier(
+    args: dict,
+    *,
+    allowed_roots: tuple[Path, ...],
+    fixed_fields: dict[str, Any],
+) -> ToolResult:
+    """Parse one Airbnb dossier. risk_class=read_only.
+
+    Args:
+        args: Tool-call kwargs from MCP. Must contain `path`.
+        allowed_roots: Read-allowed filesystem roots for the active site,
+            from SiteConfig.read_roots. The dossier path must resolve under
+            one of these.
+        fixed_fields: Site-level invariants to merge into the Stays dict
+            after parsing (overrides anything from the dossier). For
+            travelpec these are `provider: airbnb`, `is_advertised: 0`,
+            `featured_eligible: 0` per the v3 BRIEF.
+    """
     _assert_dict_keys(
         args, required={"path"}, optional=set(),
         tool_name="parse_airbnb_dossier",
     )
     _assert_str(args["path"], "path", "parse_airbnb_dossier")
 
-    # Path must live under one of the read-only roots. Dossiers are
-    # typically in BETTY_RESEARCH_DIR/01-source-data/research/
-    # airbnb-listings/ but we accept any read-allowed location so the
-    # tool works against both the local research tree and any future
-    # Drive-synced location.
-    path = _validate_path_under(
-        args["path"],
-        (BETTY_DOCS_DIR, BETTY_RESEARCH_DIR),
-    )
+    if not allowed_roots:
+        # Defense-in-depth: an empty allow-list would let any path through
+        # _validate_path_under as "not under any root" → reject. But making
+        # this explicit means the operator sees the real problem (site
+        # config bug) instead of a misleading path-traversal error.
+        raise ValueError(
+            "parse_airbnb_dossier: allowed_roots is empty. The MCP server "
+            "must pass site.read_roots from the active site config."
+        )
+
+    # Path must live under one of the site's read-allowed roots.
+    path = _validate_path_under(args["path"], allowed_roots)
     if not path.exists():
         raise ValueError(f"Dossier file does not exist: {path}")
     if not path.is_file():
@@ -467,9 +490,6 @@ def parse_airbnb_dossier(args: dict) -> ToolResult:
         "village": str(frontmatter["village"]).strip(),
         "persona": persona,
         "outbound_url": str(frontmatter["url"]).strip(),
-        "provider": "airbnb",
-        "is_advertised": 0,           # Locked default per 2026-05-26 decision
-        "featured_eligible": 0,       # Peter sets featured rotation manually
     }
 
     # Optional fields — populated only when present in frontmatter.
@@ -483,6 +503,12 @@ def parse_airbnb_dossier(args: dict) -> ToolResult:
         )
     if description:
         stays_data["description"] = description
+
+    # Merge site-level fixed fields LAST so they always win over anything
+    # the dossier or the optional-field block might claim. This is how
+    # travelpec's `provider: airbnb`, `is_advertised: 0`, and
+    # `featured_eligible: 0` invariants get enforced on every parse.
+    stays_data.update(fixed_fields)
 
     # Defense-in-depth: validate the assembled dict against the Stays
     # schema before returning. If the parser produced something the
@@ -520,16 +546,17 @@ def parse_airbnb_dossier(args: dict) -> ToolResult:
 def _self_test() -> None:
     """Self-test the parser end-to-end.
 
-    Uses a synthetic dossier written to a tempfile so the test runs
-    deterministically without depending on the live Google Drive
-    state. The synthetic content mirrors the observed real-dossier
-    shape (YAML frontmatter + scraped page body).
+    Uses a synthetic dossier written to a tempdir so the test runs
+    deterministically without depending on any external filesystem state.
+    The synthetic content mirrors the observed real-dossier shape (YAML
+    frontmatter + scraped page body). allowed_roots and fixed_fields are
+    constructed locally — this mirrors how the MCP server will build them
+    from site config at tool-call time.
     """
     import shutil
     import tempfile
 
-    print("Phase 4.6.1 Airbnb dossier parser self-test\n")
-    print(f"  BETTY_DOCS_DIR = {BETTY_DOCS_DIR}\n")
+    print("Phase 4.6.1 Airbnb dossier parser self-test (Pattern B)\n")
 
     # Write a synthetic dossier into a scratch dir under BETTY_DOCS_DIR
     # so the path validator accepts it. If BETTY_DOCS_DIR doesn't
@@ -630,21 +657,25 @@ Show more
     assert _map_property_type("") == "VacationRental"
     print("  [ok] property_type → schema_subtype mapping")
 
-    # Full tool round-trip against a real file in BETTY_DOCS_DIR.
-    if not BETTY_DOCS_DIR.exists():
-        print(f"\n  [skip] BETTY_DOCS_DIR does not exist; cannot exercise "
-              f"the full parse_airbnb_dossier tool path.")
-        return
-
-    scratch = BETTY_DOCS_DIR / ".betty-parser-selftest"
-    if scratch.exists():
-        shutil.rmtree(scratch)
-    scratch.mkdir()
+    # Full tool round-trip against synthetic dossier in a controlled tempdir.
+    # allowed_roots/fixed_fields are constructed locally — the parser is
+    # site-agnostic; the MCP server is what wires real site config in.
+    scratch = Path(tempfile.mkdtemp(prefix="betty-parser-selftest-"))
+    allowed_roots = (scratch,)
+    fixed_fields = {
+        "provider": "airbnb",
+        "is_advertised": 0,
+        "featured_eligible": 0,
+    }
     try:
         sample_path = scratch / "synthetic_cozy_test_cottage.md"
         sample_path.write_text(synthetic, encoding="utf-8")
 
-        result = parse_airbnb_dossier({"path": str(sample_path)})
+        result = parse_airbnb_dossier(
+            {"path": str(sample_path)},
+            allowed_roots=allowed_roots,
+            fixed_fields=fixed_fields,
+        )
         assert result.status == "executed"
         data = result.payload["data"]
         assert data["title"] == "Cozy Test Cottage near Sandbanks"
@@ -660,18 +691,61 @@ Show more
         print(f"  [ok] full tool round-trip — Stays dict validates against "
               f"COLLECTION_SCHEMAS")
 
+        # fixed_fields override anything the dossier might claim. Verify by
+        # injecting bogus values into the dossier and confirming site config
+        # wins.
+        adversarial_dossier = synthetic.replace(
+            "Cozy Test Cottage near Sandbanks",
+            "Cozy Test Cottage near Sandbanks",
+        )
+        # We can't easily inject `provider:` into the parser since it
+        # doesn't read that frontmatter key, but we can verify that
+        # different fixed_fields produce different output.
+        result2 = parse_airbnb_dossier(
+            {"path": str(sample_path)},
+            allowed_roots=allowed_roots,
+            fixed_fields={"provider": "airbnb",
+                          "is_advertised": 1,  # Different from default
+                          "featured_eligible": 0},
+        )
+        assert result2.payload["data"]["is_advertised"] is True, (
+            "fixed_fields should win over defaults"
+        )
+        print("  [ok] fixed_fields override applied correctly")
+
         # Path traversal blocked.
         try:
-            parse_airbnb_dossier({"path": "/etc/passwd"})
+            parse_airbnb_dossier(
+                {"path": "/etc/passwd"},
+                allowed_roots=allowed_roots,
+                fixed_fields=fixed_fields,
+            )
         except ValueError as e:
             assert "not under any allowed root" in str(e)
             print("  [ok] path traversal blocked")
         else:
             raise AssertionError("parse_airbnb_dossier should reject /etc/passwd")
 
+        # Empty allowed_roots → clear error.
+        try:
+            parse_airbnb_dossier(
+                {"path": str(sample_path)},
+                allowed_roots=(),
+                fixed_fields=fixed_fields,
+            )
+        except ValueError as e:
+            assert "allowed_roots is empty" in str(e)
+            print("  [ok] empty allowed_roots caught")
+        else:
+            raise AssertionError("empty allowed_roots should error")
+
         # Missing required key.
         try:
-            parse_airbnb_dossier({})
+            parse_airbnb_dossier(
+                {},
+                allowed_roots=allowed_roots,
+                fixed_fields=fixed_fields,
+            )
         except ValueError as e:
             assert "missing required keys" in str(e)
             print("  [ok] missing path arg rejected")
@@ -685,7 +759,11 @@ Show more
             encoding="utf-8",
         )
         try:
-            parse_airbnb_dossier({"path": str(bad_path)})
+            parse_airbnb_dossier(
+                {"path": str(bad_path)},
+                allowed_roots=allowed_roots,
+                fixed_fields=fixed_fields,
+            )
         except ValueError as e:
             assert "missing required frontmatter field" in str(e)
             print("  [ok] dossier missing required frontmatter field caught")
