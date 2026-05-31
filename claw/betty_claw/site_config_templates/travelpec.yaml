@@ -1,0 +1,126 @@
+# Site config: travelpec.com
+#
+# Schema lives in ~/.betty/sites/_README.md.
+# The canonical reviewable copy of this file is in the betty repo at
+# claw/betty_claw/site_config_templates/travelpec.yaml.
+
+id: travelpec
+domain: travelpec.com
+status: in_progress
+
+# ---------------------------------------------------------------------------
+# Filesystem roots
+# ---------------------------------------------------------------------------
+# - astro    : Astro project source. Write-allowed root.
+# - docs     : Drive-synced site metadata (BRIEF, voice doc, UI notes). Read only.
+# - research : Local source-data tree (research dossiers). Read only.
+paths:
+  astro: /Users/betty/Projects/emdash/travelpec-site
+  docs: /Users/betty/My Drive/Betty/emdash-sites/travelpec.com-v3
+  research: /Users/betty/travelpec-com
+
+# ---------------------------------------------------------------------------
+# EmDash CMS
+# ---------------------------------------------------------------------------
+# The token is read from the env var named in token_env (so the actual secret
+# stays in ~/.hermes/.env and is never committed in this config).
+emdash:
+  mcp_url: https://travelpec.com/_emdash/api/mcp
+  token_env: TRAVELPEC_EMDASH_TOKEN
+
+# ---------------------------------------------------------------------------
+# Git policy
+# ---------------------------------------------------------------------------
+# Betty's git_push tool hard-codes the working_branch as the destination ref;
+# protected_branches are off-limits to autonomous writes.
+git:
+  repo_url: github.com:betty-graceland/travelpec-com.git
+  protected_branches:
+    - main
+  working_branch: vic-overnight
+  deploy_command: "pnpm run deploy"
+
+# ---------------------------------------------------------------------------
+# EmDash collection schemas
+# ---------------------------------------------------------------------------
+# Locked from schema_get_collection probes on 2026-05-26.
+# Field types: text, number, boolean, datetime.
+# Betty's emdash_create_content_draft validates data dicts against this.
+collections:
+  stays:
+    required: [title, village, persona, outbound_url, provider]
+    fields:
+      title: text
+      village: text
+      persona: text
+      bedrooms: number
+      capacity: number
+      price_band: text
+      seasonal: text
+      outbound_url: text
+      provider: text
+      is_advertised: boolean
+      featured_eligible: boolean
+      schema_subtype: text
+      description: text
+
+  villages:
+    required: [title, tagline, region, description]
+    fields:
+      title: text
+      tagline: text
+      region: text
+      description: text
+      why_here: text
+      getting_around: text
+
+  articles:
+    required: [title, kind, excerpt, body]
+    fields:
+      title: text
+      kind: text
+      excerpt: text
+      body: text
+      publish_date: datetime
+
+  itineraries:
+    required: [title, duration_nights, persona, summary, body]
+    fields:
+      title: text
+      duration_nights: number
+      persona: text
+      summary: text
+      body: text
+
+# ---------------------------------------------------------------------------
+# Hard rules from the v3 BRIEF (non-negotiable)
+# ---------------------------------------------------------------------------
+# These flow into Betty's system prompt when she's working on this site.
+hard_rules:
+  - "Never reveal `is_advertised: true` in any public copy or markup. The flag exists internally; it never leaks to readers."
+  - "Editorial-we only. No owner-attribution language."
+  - "Never push to git's `main` branch on travelpec-com. Work on `vic-overnight` only. Peter merges to main manually after reviewing."
+  - "For Airbnb listings, images stay as `<!-- IMAGE: short description -->` placeholders in markup. I do not source, generate, or embed images. Peter swaps placeholders for real assets in a separate pass."
+  - "Each task = ≤2 MCP calls OR 1 atomic file edit. Larger work splits at queue-design time."
+
+# ---------------------------------------------------------------------------
+# Voice
+# ---------------------------------------------------------------------------
+# Path is relative to the docs root above.
+voice_doc_path: 02-voice/03-voice-calibration.md
+
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+# Parser-specific config. Each parser has its own block.
+# - target_collection : which EmDash collection the parser's output feeds.
+# - fixed_fields      : values Betty cannot override. These flow into the
+#                       Stays dict regardless of what's in the dossier.
+parsers:
+  airbnb_dossier:
+    enabled: true
+    target_collection: stays
+    fixed_fields:
+      provider: airbnb
+      is_advertised: 0
+      featured_eligible: 0
