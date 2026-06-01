@@ -88,6 +88,7 @@ from pathlib import Path
 from typing import Any
 
 from betty_claw.contracts import ToolResult
+from betty_claw.site_config import SiteCollection
 from betty_claw.tools.emdash_reads import _assert_dict_keys, _assert_str
 from betty_claw.tools.emdash_writes import _validate_data_for_collection
 from betty_claw.tools.filesystem import _validate_path_under
@@ -423,6 +424,7 @@ def parse_airbnb_dossier(
     *,
     allowed_roots: tuple[Path, ...],
     fixed_fields: dict[str, Any],
+    target_collection_schema: SiteCollection,
 ) -> ToolResult:
     """Parse one Airbnb dossier. risk_class=read_only.
 
@@ -435,6 +437,11 @@ def parse_airbnb_dossier(
             after parsing (overrides anything from the dossier). For
             travelpec these are `provider: airbnb`, `is_advertised: 0`,
             `featured_eligible: 0` per the v3 BRIEF.
+        target_collection_schema: SiteCollection for the parser's target
+            collection (e.g., site.collections["stays"] when parser_cfg
+            says target_collection="stays"). Used for defense-in-depth
+            validation of the parsed dict against the site's schema
+            before returning.
     """
     _assert_dict_keys(
         args, required={"path"}, optional=set(),
@@ -510,12 +517,12 @@ def parse_airbnb_dossier(
     # `featured_eligible: 0` invariants get enforced on every parse.
     stays_data.update(fixed_fields)
 
-    # Defense-in-depth: validate the assembled dict against the Stays
-    # schema before returning. If the parser produced something the
-    # write tool would reject, that's a parser bug we want to catch
-    # here, not when emdash_create_content_draft tries it.
+    # Defense-in-depth: validate the assembled dict against the target
+    # collection's schema before returning. If the parser produced
+    # something the write tool would reject, that's a parser bug we
+    # want to catch here, not when emdash_create_content_draft tries it.
     validated = _validate_data_for_collection(
-        "stays",
+        target_collection_schema,
         stays_data,
         "parse_airbnb_dossier",
         partial=False,
@@ -658,8 +665,9 @@ Show more
     print("  [ok] property_type → schema_subtype mapping")
 
     # Full tool round-trip against synthetic dossier in a controlled tempdir.
-    # allowed_roots/fixed_fields are constructed locally — the parser is
-    # site-agnostic; the MCP server is what wires real site config in.
+    # allowed_roots / fixed_fields / target_collection_schema are constructed
+    # locally — the parser is site-agnostic; the MCP server wires real site
+    # config in for production calls.
     #
     # Resolve the tempdir path because macOS tempdirs live under
     # /var/folders/... which is a symlink to /private/var/folders/...
@@ -674,6 +682,24 @@ Show more
         "is_advertised": 0,
         "featured_eligible": 0,
     }
+    # Synthetic SiteCollection mirroring travelpec.yaml's stays schema.
+    stays_schema = SiteCollection(
+        slug="stays",
+        fields={
+            "title": "text",
+            "village": "text",
+            "persona": "text",
+            "bedrooms": "number",
+            "capacity": "number",
+            "outbound_url": "text",
+            "provider": "text",
+            "is_advertised": "boolean",
+            "featured_eligible": "boolean",
+            "schema_subtype": "text",
+            "description": "text",
+        },
+        required=("title", "village", "persona", "outbound_url", "provider"),
+    )
     try:
         sample_path = scratch / "synthetic_cozy_test_cottage.md"
         sample_path.write_text(synthetic, encoding="utf-8")
@@ -682,6 +708,7 @@ Show more
             {"path": str(sample_path)},
             allowed_roots=allowed_roots,
             fixed_fields=fixed_fields,
+            target_collection_schema=stays_schema,
         )
         assert result.status == "executed"
         data = result.payload["data"]
@@ -714,6 +741,7 @@ Show more
             fixed_fields={"provider": "airbnb",
                           "is_advertised": 1,  # Different from default
                           "featured_eligible": 0},
+            target_collection_schema=stays_schema,
         )
         assert result2.payload["data"]["is_advertised"] is True, (
             "fixed_fields should win over defaults"
@@ -726,6 +754,7 @@ Show more
                 {"path": "/etc/passwd"},
                 allowed_roots=allowed_roots,
                 fixed_fields=fixed_fields,
+                target_collection_schema=stays_schema,
             )
         except ValueError as e:
             assert "not under any allowed root" in str(e)
@@ -739,6 +768,7 @@ Show more
                 {"path": str(sample_path)},
                 allowed_roots=(),
                 fixed_fields=fixed_fields,
+                target_collection_schema=stays_schema,
             )
         except ValueError as e:
             assert "allowed_roots is empty" in str(e)
@@ -752,6 +782,7 @@ Show more
                 {},
                 allowed_roots=allowed_roots,
                 fixed_fields=fixed_fields,
+                target_collection_schema=stays_schema,
             )
         except ValueError as e:
             assert "missing required keys" in str(e)
@@ -770,6 +801,7 @@ Show more
                 {"path": str(bad_path)},
                 allowed_roots=allowed_roots,
                 fixed_fields=fixed_fields,
+                target_collection_schema=stays_schema,
             )
         except ValueError as e:
             assert "missing required frontmatter field" in str(e)

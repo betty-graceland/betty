@@ -43,6 +43,8 @@ from datetime import datetime
 from typing import Any
 
 from betty_claw.contracts import ToolResult
+from betty_claw.emdash_client import EmdashClient
+from betty_claw.site_config import SiteCollection
 from betty_claw.tools.emdash_reads import (
     _assert_dict_keys,
     _assert_str,
@@ -232,13 +234,18 @@ def _validate_field_value(
 
 
 def _validate_data_for_collection(
-    collection: str,
+    collection_schema: SiteCollection,
     data: Any,
     tool_name: str,
     *,
     partial: bool = False,
 ) -> dict[str, Any]:
-    """Validate a `data` dict against the collection's schema.
+    """Validate a `data` dict against a SiteCollection schema.
+
+    Pattern B (2026-05-31): the schema is a SiteCollection dataclass loaded
+    from the site's YAML config, passed in by the caller. No more module-
+    level COLLECTION_SCHEMAS lookup — there's no single global truth, every
+    site declares its own collections.
 
     With partial=False (creates): all required fields must be present.
     With partial=True (updates): present fields are validated, missing
@@ -248,29 +255,21 @@ def _validate_data_for_collection(
     Unknown keys are rejected in both modes — schema/data drift is loud.
     Returns the validated (possibly type-coerced) dict.
     """
-    schema = COLLECTION_SCHEMAS.get(collection)
-    if not schema:
-        known = ", ".join(sorted(COLLECTION_SCHEMAS.keys()))
-        raise ValueError(
-            f"{tool_name}: unknown collection {collection!r}. "
-            f"Known: [{known}]. If a new collection has been added to "
-            f"EmDash, update COLLECTION_SCHEMAS in tools/emdash_writes.py."
-        )
-
     if not isinstance(data, dict):
         raise ValueError(
             f"{tool_name}.data must be dict, got {type(data).__name__}"
         )
 
-    fields = schema["fields"]
-    required = set(schema["required"])
+    fields = collection_schema.fields
+    required = set(collection_schema.required)
 
     # Check unknown keys.
     extra = set(data.keys()) - set(fields.keys())
     if extra:
         raise ValueError(
-            f"{tool_name}.data has unknown keys for {collection!r}: "
-            f"{sorted(extra)}. Allowed: {sorted(fields.keys())}"
+            f"{tool_name}.data has unknown keys for "
+            f"{collection_schema.slug!r}: {sorted(extra)}. "
+            f"Allowed: {sorted(fields.keys())}"
         )
 
     # Check required fields (full mode only).
@@ -279,7 +278,7 @@ def _validate_data_for_collection(
         if missing:
             raise ValueError(
                 f"{tool_name}.data missing required keys for "
-                f"{collection!r}: {sorted(missing)}"
+                f"{collection_schema.slug!r}: {sorted(missing)}"
             )
 
     # Validate each present field.
@@ -346,8 +345,21 @@ EMDASH_CREATE_CONTENT_DRAFT_SCHEMA: dict = {
 }
 
 
-def emdash_create_content_draft(args: dict) -> ToolResult:
-    """Create content as draft. risk_class=reversible_write."""
+def emdash_create_content_draft(
+    args: dict,
+    *,
+    client: EmdashClient,
+    collection_schema: SiteCollection,
+) -> ToolResult:
+    """Create content as draft. risk_class=reversible_write.
+
+    Args:
+        args: Tool kwargs. Required: collection, data. Optional: slug.
+        client: EmdashClient for the active site.
+        collection_schema: SiteCollection for the target collection (must
+            match args["collection"]; the MCP server enforces this match
+            before calling).
+    """
     _assert_dict_keys(
         args,
         required={"collection", "data"},
@@ -358,8 +370,19 @@ def emdash_create_content_draft(args: dict) -> ToolResult:
     if "slug" in args:
         _assert_str(args["slug"], "slug", "emdash_create_content_draft")
 
+    # Sanity check: the schema must match the collection being written to.
+    # The MCP server resolves this from site config, so a mismatch here is
+    # a server bug — but we catch it early rather than letting EmDash
+    # accept malformed data.
+    if collection_schema.slug != args["collection"]:
+        raise ValueError(
+            f"emdash_create_content_draft: collection mismatch — args says "
+            f"{args['collection']!r}, schema says {collection_schema.slug!r}. "
+            f"This is a server-side wiring bug."
+        )
+
     validated_data = _validate_data_for_collection(
-        args["collection"],
+        collection_schema,
         args["data"],
         "emdash_create_content_draft",
         partial=False,
@@ -377,6 +400,7 @@ def emdash_create_content_draft(args: dict) -> ToolResult:
         mcp_args["slug"] = args["slug"]
 
     response = _call(
+        client,
         "emdash_create_content_draft",
         "content_create",
         mcp_args,
@@ -447,8 +471,17 @@ EMDASH_UPDATE_CONTENT_DRAFT_SCHEMA: dict = {
 }
 
 
-def emdash_update_content_draft(args: dict) -> ToolResult:
-    """Update content fields (no status change). risk_class=reversible_write."""
+def emdash_update_content_draft(
+    args: dict,
+    *,
+    client: EmdashClient,
+    collection_schema: SiteCollection,
+) -> ToolResult:
+    """Update content fields (no status change). risk_class=reversible_write.
+
+    Partial-update semantics: only fields in args["data"] are changed in
+    EmDash. Use the optional `_rev` token for optimistic concurrency.
+    """
     _assert_dict_keys(
         args,
         required={"collection", "id", "data"},
@@ -460,8 +493,15 @@ def emdash_update_content_draft(args: dict) -> ToolResult:
     if "_rev" in args:
         _assert_str(args["_rev"], "_rev", "emdash_update_content_draft")
 
+    if collection_schema.slug != args["collection"]:
+        raise ValueError(
+            f"emdash_update_content_draft: collection mismatch — args says "
+            f"{args['collection']!r}, schema says {collection_schema.slug!r}. "
+            f"This is a server-side wiring bug."
+        )
+
     validated_data = _validate_data_for_collection(
-        args["collection"],
+        collection_schema,
         args["data"],
         "emdash_update_content_draft",
         partial=True,
@@ -476,6 +516,7 @@ def emdash_update_content_draft(args: dict) -> ToolResult:
         mcp_args["_rev"] = args["_rev"]
 
     response = _call(
+        client,
         "emdash_update_content_draft",
         "content_update",
         mcp_args,
@@ -586,8 +627,16 @@ EMDASH_CREATE_TAXONOMY_TERM_SCHEMA: dict = {
 }
 
 
-def emdash_create_taxonomy_term(args: dict) -> ToolResult:
-    """Create taxonomy term. risk_class=reversible_write."""
+def emdash_create_taxonomy_term(
+    args: dict,
+    *,
+    client: EmdashClient,
+) -> ToolResult:
+    """Create taxonomy term. risk_class=reversible_write.
+
+    Taxonomies don't go through the SiteCollection schema (they're separate
+    from content collections), so this tool only needs the EmDash client.
+    """
     _assert_dict_keys(
         args,
         required={"taxonomy", "slug", "label"},
@@ -609,6 +658,7 @@ def emdash_create_taxonomy_term(args: dict) -> ToolResult:
         mcp_args["parentId"] = args["parentId"]
 
     response = _call(
+        client,
         "emdash_create_taxonomy_term",
         "taxonomy_create_term",
         mcp_args,

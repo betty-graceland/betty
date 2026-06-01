@@ -75,6 +75,11 @@ from betty_claw.tools.emdash_reads import (
     emdash_list_taxonomies as _emdash_list_taxonomies,
     emdash_list_taxonomy_terms as _emdash_list_taxonomy_terms,
 )
+from betty_claw.tools.emdash_writes import (
+    emdash_create_content_draft as _emdash_create_content_draft,
+    emdash_create_taxonomy_term as _emdash_create_taxonomy_term,
+    emdash_update_content_draft as _emdash_update_content_draft,
+)
 from betty_claw.tools.filesystem import (
     list_directory as _list_directory,
     read_file as _read_file,
@@ -236,10 +241,23 @@ def parse_airbnb_dossier(site: str, path: str) -> dict[str, Any]:
     )
     config = load_site_config(site)
     parser_cfg = config.parser("airbnb_dossier")
+    if not parser_cfg.target_collection:
+        raise ValueError(
+            f"Site {site!r}: parsers.airbnb_dossier.target_collection is "
+            f"not set in the site YAML. The parser needs a target collection "
+            f"so its output can be validated against the right schema."
+        )
+    if parser_cfg.target_collection not in config.collections:
+        raise ValueError(
+            f"Site {site!r}: parsers.airbnb_dossier.target_collection="
+            f"{parser_cfg.target_collection!r} is not declared in "
+            f"collections. Add the collection to the site YAML."
+        )
     result = _parse_airbnb_dossier(
         {"path": path},
         allowed_roots=config.read_roots,
         fixed_fields=parser_cfg.fixed_fields,
+        target_collection_schema=config.collections[parser_cfg.target_collection],
     )
     logger.info(
         "parse_airbnb_dossier returning: %s",
@@ -546,6 +564,172 @@ def emdash_list_taxonomy_terms(
 
 
 # ---------------------------------------------------------------------------
+# EmDash write tools (risk_class=reversible_write; draft-only for Phase 1.5)
+# ---------------------------------------------------------------------------
+# Three write tools, all draft-only. The Judge layer (Phase 2) is not in
+# place yet, so we deliberately exclude the high-risk writes:
+#   - emdash_publish_content       (external_side_effect — visible online)
+#   - emdash_unpublish_content     (external_side_effect — pulls live content)
+#   - emdash_create_collection     (schema change — Peter's design work)
+#   - emdash_create_field          (schema change — Peter's design work)
+#
+# Safety net: drafts sit in EmDash's draft state until Peter publishes
+# manually via the EmDash UI. SiteCollection schema validation runs
+# client-side BEFORE the write hits EmDash, so malformed data is caught
+# at the MCP boundary rather than after a round-trip.
+
+def _collection_schema_for(site: str, collection: str) -> tuple[Any, Any]:
+    """Resolve (config, collection_schema) for a write tool call.
+
+    Centralizes the validation that the requested collection is declared
+    in the site YAML. Returns the full SiteConfig (callers need it for
+    the EmdashClient) and the specific SiteCollection. Raises ValueError
+    with a clear message if the collection isn't configured.
+    """
+    config = load_site_config(site)
+    if collection not in config.collections:
+        available = sorted(config.collections.keys())
+        raise ValueError(
+            f"Site {site!r} has no collection {collection!r} declared "
+            f"in its YAML. Available: {available}. If the collection "
+            f"exists in EmDash but not in the YAML, add it to "
+            f"~/.betty/sites/{site}.yaml under `collections:`."
+        )
+    return config, config.collections[collection]
+
+
+@mcp.tool()
+def emdash_create_content_draft(
+    site: str,
+    collection: str,
+    data: dict[str, Any],
+    slug: str | None = None,
+) -> dict[str, Any]:
+    """Create a new content item as a DRAFT in the named site's EmDash.
+
+    The item is NOT visible on the live site after this call — it sits in
+    EmDash's draft state. Peter reviews and publishes manually via the
+    EmDash UI. Phase 1.5 deliberately does not expose a publish tool.
+
+    Field values in `data` are validated against the site's declared
+    collection schema (from ~/.betty/sites/{site}.yaml) before the write
+    hits EmDash. Unknown fields and missing required fields are rejected.
+
+    Args:
+        site: site_id slug (e.g., "travelpec").
+        collection: Collection slug; must be declared in the site YAML.
+        data: Field values matching the collection schema.
+        slug: Optional URL slug. If omitted, EmDash auto-generates one
+            from the title.
+
+    Returns:
+        Dict containing `data` (the EmDash response with new item ID,
+        revision, etc.) and a human-readable `summary`. The item ID is
+        what subsequent emdash_update_content_draft calls use to target
+        this draft.
+    """
+    logger.info(
+        "emdash_create_content_draft called with site=%r, collection=%r, "
+        "slug=%r, data keys=%r",
+        site, collection, slug, sorted(data.keys()) if isinstance(data, dict) else "?",
+    )
+    config, collection_schema = _collection_schema_for(site, collection)
+    args: dict[str, Any] = {"collection": collection, "data": data}
+    if slug is not None:
+        args["slug"] = slug
+    client = _emdash_client_for_site(site)
+    result = _emdash_create_content_draft(
+        args, client=client, collection_schema=collection_schema,
+    )
+    return result.payload
+
+
+@mcp.tool()
+def emdash_update_content_draft(
+    site: str,
+    collection: str,
+    id: str,
+    data: dict[str, Any],
+    rev: str | None = None,
+) -> dict[str, Any]:
+    """Update fields on an existing content item in the named site's EmDash.
+
+    Partial update — only the fields in `data` are changed; other fields
+    are left as-is. Does NOT change publication status: drafts stay drafts.
+
+    The optional `rev` token enables optimistic concurrency. Pass the
+    `_rev` from a recent emdash_get_content call to detect concurrent
+    modifications and avoid silent overwrites.
+
+    Args:
+        site: site_id slug.
+        collection: Collection slug; must be declared in the site YAML.
+        id: Content item ID or slug to update.
+        data: Fields to change. Must match the collection schema; unknown
+            keys rejected.
+        rev: Optional optimistic-concurrency token.
+    """
+    logger.info(
+        "emdash_update_content_draft called with site=%r, collection=%r, "
+        "id=%r, rev=%r, data keys=%r",
+        site, collection, id, rev,
+        sorted(data.keys()) if isinstance(data, dict) else "?",
+    )
+    config, collection_schema = _collection_schema_for(site, collection)
+    args: dict[str, Any] = {
+        "collection": collection,
+        "id": id,
+        "data": data,
+    }
+    if rev is not None:
+        args["_rev"] = rev
+    client = _emdash_client_for_site(site)
+    result = _emdash_update_content_draft(
+        args, client=client, collection_schema=collection_schema,
+    )
+    return result.payload
+
+
+@mcp.tool()
+def emdash_create_taxonomy_term(
+    site: str,
+    taxonomy: str,
+    slug: str,
+    label: str,
+    parent_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a new term in a taxonomy on the named site's EmDash.
+
+    Use when an in-progress content draft references a taxonomy value
+    (e.g., a Region term) that doesn't yet exist in the system. For
+    hierarchical taxonomies, pass parent_id to nest under an existing
+    term.
+
+    Args:
+        site: site_id slug.
+        taxonomy: Taxonomy name (e.g., "region", "best_for").
+        slug: URL-safe identifier for the new term.
+        label: Human-readable display name.
+        parent_id: Optional parent term ID for hierarchical taxonomies.
+    """
+    logger.info(
+        "emdash_create_taxonomy_term called with site=%r, taxonomy=%r, "
+        "slug=%r, label=%r, parent_id=%r",
+        site, taxonomy, slug, label, parent_id,
+    )
+    args: dict[str, Any] = {
+        "taxonomy": taxonomy,
+        "slug": slug,
+        "label": label,
+    }
+    if parent_id is not None:
+        args["parentId"] = parent_id
+    client = _emdash_client_for_site(site)
+    result = _emdash_create_taxonomy_term(args, client=client)
+    return result.payload
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -594,11 +778,13 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 13 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 16 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
-        "emdash_list_taxonomies, emdash_list_taxonomy_terms"
+        "emdash_list_taxonomies, emdash_list_taxonomy_terms, "
+        "emdash_create_content_draft, emdash_update_content_draft, "
+        "emdash_create_taxonomy_term"
     )
     _preflight_sites()
     mcp.run()
