@@ -142,14 +142,18 @@ class SiteConfig:
     git: SiteGit
     collections: dict[str, SiteCollection]
     hard_rules: tuple[str, ...]
-    voice_doc_path: str
+    voice_doc_path: str | None  # Optional: empty/missing = no voice doc yet
     parsers: dict[str, SiteParser]
 
     # ---- derived helpers -------------------------------------------------
 
     @property
-    def voice_doc_full_path(self) -> Path:
-        """Absolute path to the voice calibration doc on disk."""
+    def voice_doc_full_path(self) -> Path | None:
+        """Absolute path to the voice calibration doc on disk, or None if
+        the site has no voice doc configured yet. Callers should check for
+        None before reading."""
+        if not self.voice_doc_path:
+            return None
         return self.paths.docs / self.voice_doc_path
 
     @property
@@ -293,10 +297,13 @@ def _parse_site_config(raw: dict, source_path: Path) -> SiteConfig:
     """
     context = source_path.name
 
+    # voice_doc_path is optional — sites in early development may not have
+    # written a voice calibration doc yet. Tools that need it must check
+    # for None and either skip or surface a clear error.
     _require_keys(
         raw,
         {"id", "domain", "status", "paths", "emdash", "git",
-         "collections", "hard_rules", "voice_doc_path", "parsers"},
+         "collections", "hard_rules", "parsers"},
         context,
     )
 
@@ -343,6 +350,11 @@ def _parse_site_config(raw: dict, source_path: Path) -> SiteConfig:
         for name, body in parsers_raw.items()
     }
 
+    # voice_doc_path: optional; empty string or missing field both mean
+    # "no voice doc configured yet."
+    voice_doc_raw = raw.get("voice_doc_path")
+    voice_doc_path: str | None = str(voice_doc_raw) if voice_doc_raw else None
+
     return SiteConfig(
         id=site_id,
         domain=str(raw["domain"]),
@@ -352,7 +364,7 @@ def _parse_site_config(raw: dict, source_path: Path) -> SiteConfig:
         git=git,
         collections=collections,
         hard_rules=tuple(hard_rules_raw),
-        voice_doc_path=str(raw["voice_doc_path"]),
+        voice_doc_path=voice_doc_path,
         parsers=parsers,
     )
 
@@ -627,6 +639,19 @@ parsers:
         assert "token_env" not in summary  # credentials never surface
         assert "paths" not in summary       # paths never surface
         print("  [ok] site_summary strips paths and credentials")
+
+        # ---- voice_doc_path optional ------------------------------------
+        # A site config without voice_doc_path should parse cleanly with
+        # voice_doc_path = None and voice_doc_full_path = None.
+        no_voice_yaml = valid_yaml.replace(
+            "voice_doc_path: voice.md\n", ""
+        ).replace("sampletown", "novoice")
+        (sites_dir / "novoice.yaml").write_text(no_voice_yaml)
+        load_site_config.cache_clear()
+        novoice = load_site_config("novoice", sites_dir=sites_dir)
+        assert novoice.voice_doc_path is None
+        assert novoice.voice_doc_full_path is None
+        print("  [ok] voice_doc_path optional — missing field → None")
 
     print("\nsite_config.py self-test PASSED")
 
