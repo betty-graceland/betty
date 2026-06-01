@@ -1,10 +1,10 @@
 """
-EmDash MCP read-only tools for Betty's Phase 4.6 actor.
+EmDash MCP read-only tools (refactored 2026-05-31 for Pattern B multi-site).
 
 Six tools wrap the read surface of the EmDash MCP server, all with
-risk_class=read_only — the actor inner loop skips the Judge for these
-per Phase 4.5 Decision C. They still write SKIP_READ_ONLY audit rows
-to judge_decisions for the run trail.
+risk_class=read_only — the Judge skips them under Phase 4.5 Decision C.
+They still write SKIP_READ_ONLY audit rows to judge_decisions for the
+run trail when the Phase 2 audit layer comes online.
 
   - emdash_list_collections        → schema_list_collections
   - emdash_get_collection_schema   → schema_get_collection
@@ -13,17 +13,19 @@ to judge_decisions for the run trail.
   - emdash_list_taxonomies         → taxonomy_list
   - emdash_list_taxonomy_terms     → taxonomy_list_terms
 
+PATTERN B
+=========
+Every function takes `client: EmdashClient` as a required keyword-only
+argument. The MCP server constructs the client per site (using
+site.emdash.mcp_url + site.emdash.token) and passes it through. There
+is no module-level singleton, no env-var lookup — the tools cannot
+accidentally cross-talk between sites.
+
 Validation is light: arg-shape (required keys, types, no extras) is
 enforced here so schema/validator drift is loud. Field-level constraints
 (e.g., valid collection slugs, ID format) are enforced by the EmDash
-server — errors come back via EmdashMCPError and the actor's tool-result
-loop surfaces them to Qwen for retry.
-
-A module-level EmdashClient instance is created lazily on first call.
-This avoids paying the env-var read cost during module import (matters
-for `python -m betty_claw.tools` self-test runs that don't touch the
-EmDash tools) while keeping client lifecycle simple — one client per
-process, reused across tool calls.
+server — errors come back via EmdashMCPError and surface as ValueError
+for the MCP transport to wrap.
 """
 
 from __future__ import annotations
@@ -33,27 +35,6 @@ from typing import Any
 
 from betty_claw.contracts import ToolResult
 from betty_claw.emdash_client import EmdashClient, EmdashMCPError
-
-
-# ---------------------------------------------------------------------------
-# Lazy client
-# ---------------------------------------------------------------------------
-
-_client: EmdashClient | None = None
-
-
-def _get_client() -> EmdashClient:
-    """Return the module-level EmdashClient, constructing on first call."""
-    global _client
-    if _client is None:
-        _client = EmdashClient()
-    return _client
-
-
-def _set_client_for_test(client: EmdashClient | None) -> None:
-    """Test seam: inject a client (or reset to None to force lazy re-init)."""
-    global _client
-    _client = client
 
 
 # ---------------------------------------------------------------------------
@@ -98,16 +79,16 @@ def _wrap_result(tool_name: str, data: Any, summary: str) -> ToolResult:
     )
 
 
-def _call(tool_name: str, mcp_name: str, arguments: dict) -> Any:
-    """Call the MCP tool, surfacing EmdashMCPError as ValueError.
+def _call(client: EmdashClient, tool_name: str, mcp_name: str, arguments: dict) -> Any:
+    """Call an EmDash MCP tool through the provided client.
 
-    EmdashMCPError → ValueError lets the actor's existing tool-validation
-    error handling (which already catches ValueError/TypeError) surface
-    MCP-side errors to Qwen without a new exception path. The MCP error
-    code and message are preserved in the ValueError text for diagnosis.
+    EmdashMCPError → ValueError lets the existing tool-validation error
+    handling (which already catches ValueError/TypeError) surface MCP-side
+    errors without a new exception path. The MCP error code and message
+    are preserved in the ValueError text for diagnosis.
     """
     try:
-        return _get_client().call_tool(mcp_name, arguments)
+        return client.call_tool(mcp_name, arguments)
     except EmdashMCPError as e:
         raise ValueError(
             f"{tool_name}: EmDash MCP returned error {e.code}: {e.message}"
@@ -137,11 +118,11 @@ EMDASH_LIST_COLLECTIONS_SCHEMA: dict = {
 }
 
 
-def emdash_list_collections(args: dict) -> ToolResult:
+def emdash_list_collections(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(args, required=set(), optional=set(),
                       tool_name="emdash_list_collections")
-    data = _call("emdash_list_collections", "schema_list_collections", {})
+    data = _call(client, "emdash_list_collections", "schema_list_collections", {})
     items = data.get("items") if isinstance(data, dict) else data
     count = len(items) if isinstance(items, list) else "?"
     return _wrap_result(
@@ -183,12 +164,13 @@ EMDASH_GET_COLLECTION_SCHEMA_SCHEMA: dict = {
 }
 
 
-def emdash_get_collection_schema(args: dict) -> ToolResult:
+def emdash_get_collection_schema(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(args, required={"slug"}, optional=set(),
                       tool_name="emdash_get_collection_schema")
     _assert_str(args["slug"], "slug", "emdash_get_collection_schema")
     data = _call(
+        client,
         "emdash_get_collection_schema",
         "schema_get_collection",
         {"slug": args["slug"]},
@@ -246,7 +228,7 @@ EMDASH_LIST_CONTENT_SCHEMA: dict = {
 }
 
 
-def emdash_list_content(args: dict) -> ToolResult:
+def emdash_list_content(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(
         args,
@@ -275,7 +257,7 @@ def emdash_list_content(args: dict) -> ToolResult:
         _assert_str(args["cursor"], "cursor", "emdash_list_content")
 
     mcp_args = {k: v for k, v in args.items() if k in {"collection", "status", "limit", "cursor"}}
-    data = _call("emdash_list_content", "content_list", mcp_args)
+    data = _call(client, "emdash_list_content", "content_list", mcp_args)
     items = data.get("items") if isinstance(data, dict) else None
     count = len(items) if isinstance(items, list) else "?"
     return _wrap_result(
@@ -319,13 +301,14 @@ EMDASH_GET_CONTENT_SCHEMA: dict = {
 }
 
 
-def emdash_get_content(args: dict) -> ToolResult:
+def emdash_get_content(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(args, required={"collection", "id"}, optional=set(),
                       tool_name="emdash_get_content")
     _assert_str(args["collection"], "collection", "emdash_get_content")
     _assert_str(args["id"], "id", "emdash_get_content")
     data = _call(
+        client,
         "emdash_get_content",
         "content_get",
         {"collection": args["collection"], "id": args["id"]},
@@ -374,11 +357,11 @@ EMDASH_LIST_TAXONOMIES_SCHEMA: dict = {
 }
 
 
-def emdash_list_taxonomies(args: dict) -> ToolResult:
+def emdash_list_taxonomies(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(args, required=set(), optional=set(),
                       tool_name="emdash_list_taxonomies")
-    data = _call("emdash_list_taxonomies", "taxonomy_list", {})
+    data = _call(client, "emdash_list_taxonomies", "taxonomy_list", {})
     # Try common list-bearing keys before falling back to "?".
     count: int | str = "?"
     if isinstance(data, list):
@@ -428,7 +411,7 @@ EMDASH_LIST_TAXONOMY_TERMS_SCHEMA: dict = {
 }
 
 
-def emdash_list_taxonomy_terms(args: dict) -> ToolResult:
+def emdash_list_taxonomy_terms(args: dict, *, client: EmdashClient) -> ToolResult:
     """risk_class=read_only."""
     _assert_dict_keys(
         args,
@@ -450,7 +433,7 @@ def emdash_list_taxonomy_terms(args: dict) -> ToolResult:
             )
 
     mcp_args = {k: v for k, v in args.items() if k in {"taxonomy", "limit"}}
-    data = _call("emdash_list_taxonomy_terms", "taxonomy_list_terms", mcp_args)
+    data = _call(client, "emdash_list_taxonomy_terms", "taxonomy_list_terms", mcp_args)
     items = data.get("items") if isinstance(data, dict) else None
     count = len(items) if isinstance(items, list) else "?"
     return _wrap_result(
@@ -465,22 +448,28 @@ def emdash_list_taxonomy_terms(args: dict) -> ToolResult:
 # ---------------------------------------------------------------------------
 
 def _self_test() -> None:
-    """Live self-test against the configured EmDash MCP server.
+    """Live self-test against a configured EmDash MCP server.
 
     Read-only — no state mutation. Hits each of the six read tools at
-    least once. If EMDASH_TOKEN isn't set, exits with a skip message.
+    least once. Constructs the client from EMDASH_TOKEN/EMDASH_MCP_URL
+    in env so the test works standalone (the MCP server wires the same
+    values from site config at runtime).
     """
     import os
 
-    print("Phase 4.6 EmDash read tools self-test\n")
+    print("Phase 4.6 EmDash read tools self-test (Pattern B)\n")
 
-    if not os.environ.get("EMDASH_TOKEN"):
+    token = os.environ.get("EMDASH_TOKEN")
+    if not token:
         print("  [skip] EMDASH_TOKEN not in env; cannot exercise live MCP. "
-              "Set EMDASH_TOKEN and EMDASH_MCP_URL in ~/code/betty/.env.")
+              "Set EMDASH_TOKEN (and optionally EMDASH_MCP_URL) before re-running.")
         return
 
+    url = os.environ.get("EMDASH_MCP_URL")
+    client = EmdashClient(token=token, url=url)
+
     # ---- emdash_list_collections ----
-    result = emdash_list_collections({})
+    result = emdash_list_collections({}, client=client)
     assert result.status == "executed"
     print(f"  [ok] {result.payload['summary']}")
 
@@ -490,14 +479,17 @@ def _self_test() -> None:
     assert "stays" in slugs, f"expected stays in {slugs}"
 
     # ---- emdash_get_collection_schema ----
-    result = emdash_get_collection_schema({"slug": "stays"})
+    result = emdash_get_collection_schema({"slug": "stays"}, client=client)
     assert result.status == "executed"
     fields = result.payload["data"]["fields"]
     assert any(f["slug"] == "title" for f in fields), "stays must have title field"
     print(f"  [ok] {result.payload['summary']}")
 
     # ---- emdash_list_content ----
-    result = emdash_list_content({"collection": "stays", "status": "published", "limit": 10})
+    result = emdash_list_content(
+        {"collection": "stays", "status": "published", "limit": 10},
+        client=client,
+    )
     assert result.status == "executed"
     items = result.payload["data"]["items"]
     print(f"  [ok] {result.payload['summary']}")
@@ -505,15 +497,15 @@ def _self_test() -> None:
     # ---- emdash_get_content (use first published stay) ----
     if items:
         first = items[0]
-        result = emdash_get_content({
-            "collection": "stays",
-            "id": first["id"],
-        })
+        result = emdash_get_content(
+            {"collection": "stays", "id": first["id"]},
+            client=client,
+        )
         assert result.status == "executed"
         print(f"  [ok] {result.payload['summary']}")
 
     # ---- emdash_list_taxonomies ----
-    result = emdash_list_taxonomies({})
+    result = emdash_list_taxonomies({}, client=client)
     assert result.status == "executed"
     print(f"  [ok] {result.payload['summary']}")
 
@@ -528,13 +520,16 @@ def _self_test() -> None:
             if isinstance(first_taxonomy, dict) else None
         )
         if name:
-            result = emdash_list_taxonomy_terms({"taxonomy": name, "limit": 10})
+            result = emdash_list_taxonomy_terms(
+                {"taxonomy": name, "limit": 10},
+                client=client,
+            )
             assert result.status == "executed"
             print(f"  [ok] {result.payload['summary']}")
 
     # ---- Validator: missing required keys ----
     try:
-        emdash_get_content({"collection": "stays"})  # missing id
+        emdash_get_content({"collection": "stays"}, client=client)  # missing id
     except ValueError as e:
         assert "missing required keys" in str(e)
         print(f"  [ok] emdash_get_content rejected missing id")
@@ -543,7 +538,7 @@ def _self_test() -> None:
 
     # ---- Validator: extra keys ----
     try:
-        emdash_list_collections({"unexpected": "value"})
+        emdash_list_collections({"unexpected": "value"}, client=client)
     except ValueError as e:
         assert "unknown keys" in str(e)
         print(f"  [ok] emdash_list_collections rejected extra keys")
@@ -552,7 +547,10 @@ def _self_test() -> None:
 
     # ---- MCP-side error surfaces as ValueError ----
     try:
-        emdash_get_collection_schema({"slug": "definitely_not_a_real_collection"})
+        emdash_get_collection_schema(
+            {"slug": "definitely_not_a_real_collection"},
+            client=client,
+        )
     except ValueError as e:
         assert "EmDash MCP returned error" in str(e)
         print(f"  [ok] MCP-side error surfaced as ValueError")

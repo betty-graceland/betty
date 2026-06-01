@@ -52,17 +52,28 @@ from __future__ import annotations
 
 import logging
 import sys
+from functools import lru_cache
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from betty_claw.emdash_client import EmdashClient
 from betty_claw.site_config import (
+    SiteConfig,
     list_available_sites,
     load_site_config,
     site_summary,
 )
 from betty_claw.tools.airbnb_parser import (
     parse_airbnb_dossier as _parse_airbnb_dossier,
+)
+from betty_claw.tools.emdash_reads import (
+    emdash_get_collection_schema as _emdash_get_collection_schema,
+    emdash_get_content as _emdash_get_content,
+    emdash_list_collections as _emdash_list_collections,
+    emdash_list_content as _emdash_list_content,
+    emdash_list_taxonomies as _emdash_list_taxonomies,
+    emdash_list_taxonomy_terms as _emdash_list_taxonomy_terms,
 )
 
 
@@ -230,6 +241,183 @@ def parse_airbnb_dossier(site: str, path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Per-site EmDash client cache
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=16)
+def _emdash_client_for_site(site_id: str) -> EmdashClient:
+    """Return an EmdashClient configured for the named site.
+
+    Cached by site_id since clients are stateless except for token+URL
+    (both immutable for the MCP subprocess lifetime). On first use for a
+    site, the call reads site config, validates the token env var is set,
+    and constructs the httpx-wrapped client.
+
+    Cache invalidation is intentional: site config + tokens are fixed
+    until Hermes restart. Editing a site YAML or rotating a token
+    requires a Hermes restart, which respawns this server and clears
+    the cache.
+
+    Raises ValueError if the site config is missing or the token env var
+    isn't set (surfaces as a clean MCP tool error rather than a transport
+    failure deep in httpx).
+    """
+    config = load_site_config(site_id)
+    # SiteEmdash.token raises a clear ValueError if the env var isn't set;
+    # we let that propagate. The MCP layer wraps it for Hermes.
+    return EmdashClient(token=config.emdash.token, url=config.emdash.mcp_url)
+
+
+# ---------------------------------------------------------------------------
+# EmDash read tools (risk_class=read_only; Judge-skip)
+# ---------------------------------------------------------------------------
+# All six tools take `site` as their first parameter. The server resolves
+# the per-site EmdashClient (cached), then calls the underlying read
+# function with the standard args dict + client kwarg. Return value is
+# the tool payload (data + summary) — Hermes/Qwen gets a structured dict.
+
+@mcp.tool()
+def emdash_list_collections(site: str) -> dict[str, Any]:
+    """List every content collection in the named site's EmDash CMS.
+
+    Returns slug, label, and supported features for each collection. Use
+    to discover what content types exist before reading or writing.
+
+    Args:
+        site: site_id slug (e.g., "travelpec").
+    """
+    logger.info("emdash_list_collections called with site=%r", site)
+    client = _emdash_client_for_site(site)
+    result = _emdash_list_collections({}, client=client)
+    return result.payload
+
+
+@mcp.tool()
+def emdash_get_collection_schema(site: str, slug: str) -> dict[str, Any]:
+    """Get the full schema of one EmDash collection in the named site.
+
+    Returns every field with its type, required flag, and constraints.
+    Required before any content_create/update so Betty knows the field
+    shape the server expects.
+
+    Args:
+        site: site_id slug.
+        slug: Collection slug (e.g., "stays", "villages", "articles").
+    """
+    logger.info(
+        "emdash_get_collection_schema called with site=%r, slug=%r", site, slug
+    )
+    client = _emdash_client_for_site(site)
+    result = _emdash_get_collection_schema({"slug": slug}, client=client)
+    return result.payload
+
+
+@mcp.tool()
+def emdash_list_content(
+    site: str,
+    collection: str,
+    status: str | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List content items in a collection on the named site.
+
+    Returns items sorted by the server's default order. Pass
+    status='published' to filter to live items only.
+
+    Args:
+        site: site_id slug.
+        collection: Collection slug.
+        status: Optional filter — 'draft' | 'published' | 'scheduled'.
+        limit: Optional max items (default 50, max 100).
+        cursor: Optional pagination cursor from a previous response.
+    """
+    logger.info(
+        "emdash_list_content called with site=%r, collection=%r, status=%r, "
+        "limit=%r, cursor=%r",
+        site, collection, status, limit, cursor,
+    )
+    args: dict[str, Any] = {"collection": collection}
+    if status is not None:
+        args["status"] = status
+    if limit is not None:
+        args["limit"] = limit
+    if cursor is not None:
+        args["cursor"] = cursor
+    client = _emdash_client_for_site(site)
+    result = _emdash_list_content(args, client=client)
+    return result.payload
+
+
+@mcp.tool()
+def emdash_get_content(site: str, collection: str, id: str) -> dict[str, Any]:
+    """Get a single content item by ID or slug from the named site.
+
+    Returns the full data plus a `_rev` token for optimistic concurrency
+    on the next update. Always call this before emdash_update_content_draft
+    to obtain a fresh _rev.
+
+    Args:
+        site: site_id slug.
+        collection: Collection slug.
+        id: Content item ID (ULID) or slug.
+    """
+    logger.info(
+        "emdash_get_content called with site=%r, collection=%r, id=%r",
+        site, collection, id,
+    )
+    client = _emdash_client_for_site(site)
+    result = _emdash_get_content(
+        {"collection": collection, "id": id},
+        client=client,
+    )
+    return result.payload
+
+
+@mcp.tool()
+def emdash_list_taxonomies(site: str) -> dict[str, Any]:
+    """List all taxonomy definitions in the named site's CMS.
+
+    Returns name, label, and hierarchical flag for each taxonomy
+    (categories, tags, region, best_for, etc.).
+
+    Args:
+        site: site_id slug.
+    """
+    logger.info("emdash_list_taxonomies called with site=%r", site)
+    client = _emdash_client_for_site(site)
+    result = _emdash_list_taxonomies({}, client=client)
+    return result.payload
+
+
+@mcp.tool()
+def emdash_list_taxonomy_terms(
+    site: str,
+    taxonomy: str,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """List terms within one taxonomy on the named site.
+
+    Returns slug, label, and parent linkage for hierarchical taxonomies.
+
+    Args:
+        site: site_id slug.
+        taxonomy: Taxonomy name (e.g., "region", "best_for").
+        limit: Optional max terms (default 50, max 100).
+    """
+    logger.info(
+        "emdash_list_taxonomy_terms called with site=%r, taxonomy=%r, limit=%r",
+        site, taxonomy, limit,
+    )
+    args: dict[str, Any] = {"taxonomy": taxonomy}
+    if limit is not None:
+        args["limit"] = limit
+    client = _emdash_client_for_site(site)
+    result = _emdash_list_taxonomy_terms(args, client=client)
+    return result.payload
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -278,7 +466,10 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 3 tools: list_sites, betty_ping, parse_airbnb_dossier"
+        "Exposing 9 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "emdash_list_collections, emdash_get_collection_schema, "
+        "emdash_list_content, emdash_get_content, "
+        "emdash_list_taxonomies, emdash_list_taxonomy_terms"
     )
     _preflight_sites()
     mcp.run()
