@@ -1,39 +1,31 @@
 """
-Filesystem tools for Betty's Phase 4.6 actor.
+Filesystem tools (refactored 2026-05-31 for Pattern B multi-site).
 
-Three atomic tools wrap the host filesystem under a fixed allow-list of
-roots: read_file, list_directory, write_file. Per Phase 4.4 Q1 Decision A,
-each tool declares one constant risk_class (the registry handles that),
-and the bounds on what paths the actor can touch are STRUCTURAL — the
-validators reject any path that doesn't resolve under an allowed root,
-regardless of what Qwen emits.
+Three atomic tools wrap the host filesystem under a per-call allow-list:
+read_file, list_directory, write_file. Each tool declares one constant
+risk_class, and path access is STRUCTURAL — the validator rejects any
+path that doesn't resolve under one of the allowed roots passed by the
+caller, regardless of what the tool's caller emits.
 
-Allowed roots (via env at module load):
+PATTERN B
+=========
+read_file and list_directory now take `allowed_roots: tuple[Path, ...]`
+as a keyword-only argument. The MCP server passes the active site's
+SiteConfig.read_roots (paths.astro + paths.docs + paths.research) on
+each call, so the same function serves every site without module-level
+state.
 
-  BETTY_SITE_DIR     — read + list + write. The Astro project working tree
-                       (default: ~/Projects/emdash/travelpec-site). git_*
-                       tools also operate on this directory.
+write_file still uses the legacy WRITE_ROOTS module-global; that tool
+will be refactored in Phase 1.3 when the Judge layer comes online.
 
-  BETTY_DOCS_DIR     — read + list only (NOT writable from these tools).
-                       Drive-synced metadata: kickoff brief, voice doc,
-                       UI-polish notes, architecture decisions
-                       (default: ~/My Drive/Betty/emdash-sites/travelpec.com-v3).
-
-  BETTY_RESEARCH_DIR — read + list only. Local-disk copy of the project's
-                       source data and research dossiers (the 35 Airbnb
-                       scrapes, the article research files). NOT Drive-
-                       synced — Phase 4.6.1 confirmed the SOP folder
-                       01-source-data/ lives locally, not in the Drive
-                       mirror that holds the metadata folders.
-                       (default: ~/travelpec-com).
-
-All three are resolved (symlinks followed) at module load. A path that doesn't
-resolve under one of these roots raises ValueError at validate-time, before
-any file I/O.
+The BETTY_SITE_DIR / BETTY_DOCS_DIR / BETTY_RESEARCH_DIR globals at the
+top of the file are vestigial: only the deprecated actor.py reads them
+(for the voice calibration path). Phase 4.7.0 cleanup will remove both
+the actor and these globals.
 
 write_file uses the atomic_io.atomic_write pattern (tmpfile + fsync +
-os.replace) so the Judge / a concurrent reader never observes a partial
-write. read_file and list_directory have no side effects.
+os.replace) so neither the Judge nor a concurrent reader can observe a
+partial write. read_file and list_directory have no side effects.
 """
 
 from __future__ import annotations
@@ -170,19 +162,30 @@ READ_FILE_SCHEMA: dict = {
 _READ_FILE_MAX_BYTES = 5 * 1024 * 1024
 
 
-def _validate_read_file_args(args: dict) -> Path:
+def _validate_read_file_args(args: dict, allowed_roots: tuple[Path, ...]) -> Path:
     if not isinstance(args, dict):
         raise ValueError(f"args must be dict, got {type(args).__name__}")
     if set(args.keys()) != {"path"}:
         raise ValueError(
             f"read_file expects exactly {{'path'}}; got {sorted(args.keys())}"
         )
-    return _validate_path_under(args["path"], READ_ROOTS)
+    if not allowed_roots:
+        raise ValueError(
+            "read_file: allowed_roots is empty. The MCP server must pass "
+            "site.read_roots from the active site config."
+        )
+    return _validate_path_under(args["path"], allowed_roots)
 
 
-def read_file(args: dict) -> ToolResult:
-    """Read a text file from the allow-listed roots. risk_class=read_only."""
-    path = _validate_read_file_args(args)
+def read_file(args: dict, *, allowed_roots: tuple[Path, ...]) -> ToolResult:
+    """Read a text file from the allow-listed roots. risk_class=read_only.
+
+    Args:
+        args: Tool-call kwargs. Must contain `path`.
+        allowed_roots: Read-allowed filesystem roots for the active site,
+            from SiteConfig.read_roots. The path must resolve under one.
+    """
+    path = _validate_read_file_args(args, allowed_roots)
 
     if not path.exists():
         raise ValueError(f"File does not exist: {path}")
@@ -252,19 +255,30 @@ LIST_DIRECTORY_SCHEMA: dict = {
 }
 
 
-def _validate_list_directory_args(args: dict) -> Path:
+def _validate_list_directory_args(args: dict, allowed_roots: tuple[Path, ...]) -> Path:
     if not isinstance(args, dict):
         raise ValueError(f"args must be dict, got {type(args).__name__}")
     if set(args.keys()) != {"path"}:
         raise ValueError(
             f"list_directory expects exactly {{'path'}}; got {sorted(args.keys())}"
         )
-    return _validate_path_under(args["path"], READ_ROOTS)
+    if not allowed_roots:
+        raise ValueError(
+            "list_directory: allowed_roots is empty. The MCP server must "
+            "pass site.read_roots from the active site config."
+        )
+    return _validate_path_under(args["path"], allowed_roots)
 
 
-def list_directory(args: dict) -> ToolResult:
-    """List immediate children of a directory. risk_class=read_only."""
-    path = _validate_list_directory_args(args)
+def list_directory(args: dict, *, allowed_roots: tuple[Path, ...]) -> ToolResult:
+    """List immediate children of a directory. risk_class=read_only.
+
+    Args:
+        args: Tool-call kwargs. Must contain `path`.
+        allowed_roots: Read-allowed filesystem roots for the active site,
+            from SiteConfig.read_roots. The path must resolve under one.
+    """
+    path = _validate_list_directory_args(args, allowed_roots)
 
     if not path.exists():
         raise ValueError(f"Directory does not exist: {path}")
@@ -444,23 +458,39 @@ def _self_test() -> None:
         assert target.read_text() == "hello betty\nline two\n"
         print(f"  [ok] write_file wrote {result.payload['bytes_written']} bytes")
 
+        # Pattern B: read_file and list_directory take per-call allowed_roots.
+        # For self-test purposes, scratch is its own read-root.
+        read_roots = (scratch.resolve(),)
+
         # ---- read_file happy path ----
-        result = read_file({"path": str(target)})
+        result = read_file({"path": str(target)}, allowed_roots=read_roots)
         assert result.status == "executed"
         assert result.payload["content"] == "hello betty\nline two\n"
         assert result.payload["size_bytes"] == len("hello betty\nline two\n")
         print(f"  [ok] read_file returned {result.payload['size_bytes']} bytes")
 
         # ---- list_directory happy path ----
-        result = list_directory({"path": str(scratch / "subdir")})
+        result = list_directory(
+            {"path": str(scratch / "subdir")},
+            allowed_roots=read_roots,
+        )
         assert result.status == "executed"
         names = [e["name"] for e in result.payload["entries"]]
         assert "hello.txt" in names
         print(f"  [ok] list_directory found {len(names)} entries")
 
+        # ---- empty allowed_roots → clear error ----
+        try:
+            read_file({"path": str(target)}, allowed_roots=())
+        except ValueError as e:
+            assert "allowed_roots is empty" in str(e)
+            print(f"  [ok] read_file caught empty allowed_roots")
+        else:
+            raise AssertionError("empty allowed_roots should error")
+
         # ---- path traversal blocked ----
         try:
-            read_file({"path": "/etc/passwd"})
+            read_file({"path": "/etc/passwd"}, allowed_roots=read_roots)
         except ValueError as e:
             assert "not under any allowed root" in str(e)
             print(f"  [ok] read_file rejected /etc/passwd")
@@ -485,7 +515,10 @@ def _self_test() -> None:
 
         # ---- read_file rejects missing file ----
         try:
-            read_file({"path": str(scratch / "does-not-exist.txt")})
+            read_file(
+                {"path": str(scratch / "does-not-exist.txt")},
+                allowed_roots=read_roots,
+            )
         except ValueError as e:
             assert "does not exist" in str(e)
             print(f"  [ok] read_file rejected missing file")

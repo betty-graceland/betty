@@ -75,6 +75,10 @@ from betty_claw.tools.emdash_reads import (
     emdash_list_taxonomies as _emdash_list_taxonomies,
     emdash_list_taxonomy_terms as _emdash_list_taxonomy_terms,
 )
+from betty_claw.tools.filesystem import (
+    list_directory as _list_directory,
+    read_file as _read_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +241,61 @@ def parse_airbnb_dossier(site: str, path: str) -> dict[str, Any]:
         "parse_airbnb_dossier returning: %s",
         result.payload.get("summary", "(no summary)"),
     )
+    return result.payload
+
+
+# ---------------------------------------------------------------------------
+# Filesystem read tools (risk_class=read_only)
+# ---------------------------------------------------------------------------
+# read_file and list_directory take `site` first. The server resolves the
+# site's read_roots (paths.astro + paths.docs + paths.research) from site
+# config and passes them as allowed_roots to the underlying function.
+# write_file is deferred to Phase 1.3 when the Judge layer comes online.
+
+@mcp.tool()
+def read_file(site: str, path: str) -> dict[str, Any]:
+    """Read a UTF-8 text file from one of the named site's read roots.
+
+    The path must resolve under paths.astro, paths.docs, or paths.research
+    in the site's YAML; otherwise rejected. Files >5MB are rejected to
+    keep them out of the context window — use list_directory then targeted
+    reads for large trees.
+
+    Args:
+        site: site_id slug (e.g., "travelpec").
+        path: Absolute or ~-prefixed path to a regular file.
+
+    Returns:
+        Dict with `path`, `content`, `size_bytes`, and `summary`. No side
+        effects.
+    """
+    logger.info("read_file called with site=%r, path=%r", site, path)
+    config = load_site_config(site)
+    result = _read_file({"path": path}, allowed_roots=config.read_roots)
+    return result.payload
+
+
+@mcp.tool()
+def list_directory(site: str, path: str) -> dict[str, Any]:
+    """List immediate children of a directory under the named site's read
+    roots. Does NOT recurse — call repeatedly with subdirectory paths to
+    walk a tree.
+
+    Returns entries sorted alphabetically, each with `kind` ('file' or
+    'dir') and `size_bytes` for files. Symlinks and other non-regular
+    entries are skipped.
+
+    Args:
+        site: site_id slug.
+        path: Absolute or ~-prefixed directory path. Must resolve under
+            one of the site's read roots.
+
+    Returns:
+        Dict with `path`, `entries`, and `summary`. No side effects.
+    """
+    logger.info("list_directory called with site=%r, path=%r", site, path)
+    config = load_site_config(site)
+    result = _list_directory({"path": path}, allowed_roots=config.read_roots)
     return result.payload
 
 
@@ -466,7 +525,8 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 9 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 11 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "read_file, list_directory, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms"
