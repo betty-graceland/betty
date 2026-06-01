@@ -79,6 +79,10 @@ from betty_claw.tools.filesystem import (
     list_directory as _list_directory,
     read_file as _read_file,
 )
+from betty_claw.tools.git_ops import (
+    git_diff as _git_diff,
+    git_status as _git_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +300,71 @@ def list_directory(site: str, path: str) -> dict[str, Any]:
     logger.info("list_directory called with site=%r, path=%r", site, path)
     config = load_site_config(site)
     result = _list_directory({"path": path}, allowed_roots=config.read_roots)
+    return result.payload
+
+
+# ---------------------------------------------------------------------------
+# Git read tools (risk_class=read_only)
+# ---------------------------------------------------------------------------
+# git_status and git_diff operate against the named site's Astro working
+# tree (paths.astro). The MCP server resolves that path from site config
+# and passes it as cwd to the underlying functions. git_commit_all and
+# git_push are deferred to Phase 1.4 — they need the Judge layer first.
+
+@mcp.tool()
+def git_status(site: str) -> dict[str, Any]:
+    """Show working-tree status of the named site's Astro repo.
+
+    Uses `git status --porcelain -b` for machine-readable output. Returns
+    the current branch, a list of changed entries (each with porcelain code
+    + path), and a `clean` boolean.
+
+    Args:
+        site: site_id slug (e.g., "travelpec").
+
+    Returns:
+        Dict with `branch`, `branch_line`, `entries`, `clean`, `summary`.
+        No side effects.
+    """
+    logger.info("git_status called with site=%r", site)
+    config = load_site_config(site)
+    result = _git_status({}, cwd=config.paths.astro)
+    return result.payload
+
+
+@mcp.tool()
+def git_diff(
+    site: str,
+    path: str | None = None,
+    staged: bool = False,
+) -> dict[str, Any]:
+    """Show pending changes in the named site's Astro repo.
+
+    By default shows unstaged changes against the working tree. Pass
+    staged=True for staged changes against HEAD. Optionally scope to a
+    specific path (relative to the repo root).
+
+    Output is capped at 64KB to keep large diffs out of context — if
+    truncated, the `truncated` field is True and Betty should commit
+    smaller batches or scope to specific paths.
+
+    Args:
+        site: site_id slug.
+        path: Optional repo-relative path to scope the diff.
+        staged: If True, show staged changes (git diff --staged).
+
+    Returns:
+        Dict with `path`, `staged`, `diff`, `truncated`, `summary`.
+        No side effects.
+    """
+    logger.info(
+        "git_diff called with site=%r, path=%r, staged=%r", site, path, staged
+    )
+    args: dict[str, Any] = {"staged": staged}
+    if path is not None:
+        args["path"] = path
+    config = load_site_config(site)
+    result = _git_diff(args, cwd=config.paths.astro)
     return result.payload
 
 
@@ -525,8 +594,8 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 11 tools: list_sites, betty_ping, parse_airbnb_dossier, "
-        "read_file, list_directory, "
+        "Exposing 13 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "read_file, list_directory, git_status, git_diff, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms"

@@ -136,11 +136,18 @@ def _validate_git_status_args(args: dict) -> None:
         )
 
 
-def git_status(args: dict) -> ToolResult:
-    """Show working-tree status. risk_class=read_only."""
+def git_status(args: dict, *, cwd: Path = BETTY_SITE_DIR) -> ToolResult:
+    """Show working-tree status. risk_class=read_only.
+
+    Args:
+        args: Tool-call kwargs (no required keys; empty dict accepted).
+        cwd: Repo working directory. The MCP server passes site.paths.astro
+            from site config. Default kept for legacy callers; new
+            multi-site callers pass explicitly.
+    """
     _validate_git_status_args(args)
 
-    proc = _run_git(["status", "--porcelain", "-b"])
+    proc = _run_git(["status", "--porcelain", "-b"], cwd=cwd)
     if proc.returncode != 0:
         raise ValueError(
             f"git status failed (rc={proc.returncode}): {proc.stderr[:500]}"
@@ -159,7 +166,7 @@ def git_status(args: dict) -> ToolResult:
         path = line[3:]
         entries.append({"code": code, "path": path})
 
-    branch_name = _current_branch()
+    branch_name = _current_branch(cwd=cwd)
     return ToolResult(
         call_id=str(uuid.uuid4()),
         tool_name="git_status",
@@ -238,8 +245,14 @@ def _validate_git_diff_args(args: dict) -> tuple[str | None, bool]:
     return path, staged
 
 
-def git_diff(args: dict) -> ToolResult:
-    """Show diff. risk_class=read_only."""
+def git_diff(args: dict, *, cwd: Path = BETTY_SITE_DIR) -> ToolResult:
+    """Show diff. risk_class=read_only.
+
+    Args:
+        args: Tool-call kwargs. Optional `path` (str) and `staged` (bool).
+        cwd: Repo working directory. The MCP server passes site.paths.astro
+            from site config.
+    """
     path, staged = _validate_git_diff_args(args)
 
     argv = ["diff"]
@@ -248,7 +261,7 @@ def git_diff(args: dict) -> ToolResult:
     if path:
         argv.extend(["--", path])
 
-    proc = _run_git(argv)
+    proc = _run_git(argv, cwd=cwd)
     if proc.returncode != 0:
         raise ValueError(
             f"git diff failed (rc={proc.returncode}): {proc.stderr[:500]}"
