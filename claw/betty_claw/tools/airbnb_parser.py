@@ -660,7 +660,14 @@ Show more
     # Full tool round-trip against synthetic dossier in a controlled tempdir.
     # allowed_roots/fixed_fields are constructed locally — the parser is
     # site-agnostic; the MCP server is what wires real site config in.
-    scratch = Path(tempfile.mkdtemp(prefix="betty-parser-selftest-"))
+    #
+    # Resolve the tempdir path because macOS tempdirs live under
+    # /var/folders/... which is a symlink to /private/var/folders/...
+    # _validate_path_under resolves the INPUT path before comparing, so the
+    # allowed-root has to be resolved too or they'll never match. Production
+    # paths (/Users/betty/...) aren't symlinks, so SiteConfig doesn't need
+    # this — it's only a tempfile-on-macOS artifact.
+    scratch = Path(tempfile.mkdtemp(prefix="betty-parser-selftest-")).resolve()
     allowed_roots = (scratch,)
     fixed_fields = {
         "provider": "airbnb",
