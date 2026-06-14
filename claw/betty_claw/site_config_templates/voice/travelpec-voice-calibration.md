@@ -245,3 +245,45 @@ Before returning your draft, verify each item:
    usually means I am inventing. Tighten.)
 
 If any answer requires a fix, revise and re-check before submitting.
+
+## 8. Required validation workflow (Phase 1.7)
+
+Before calling `mcp_betty_emdash_create_content_draft` or
+`mcp_betty_emdash_update_content_draft`, you MUST call
+`mcp_betty_validate_against_voice` and fix any violations it returns.
+
+### The validation loop
+
+1. Rewrite the description (or any field in `check_fields`) following
+   the rules above.
+2. Call `mcp_betty_validate_against_voice(site, text, source_text)`
+   where `text` is your rewritten field and `source_text` is the
+   concatenation of the parsed `frontmatter` and `body_excerpt` from
+   `parse_airbnb_dossier`.
+3. If the response has `compliant: true`, proceed to write.
+4. If the response has `compliant: false`, read the `violations` list.
+   Each violation has a `rule`, the offending `match` string, a
+   `position` in your text, and an `explanation`. Fix all violations
+   in your text.
+5. Re-call validate. Repeat until compliant.
+6. Only then call `mcp_betty_emdash_create_content_draft`.
+
+### Backstop
+
+The write tools also run validation automatically. If you skip the
+explicit `validate_against_voice` call, the write tool will refuse
+non-compliant drafts and return the first violation. You will have
+wasted a tool call. The explicit validate-first loop is faster
+because you see the full list of violations at once.
+
+### What to pass as source_text
+
+For `parse_airbnb_dossier` output, pass:
+
+```
+source_text = str(payload["frontmatter"]) + "\n" + payload["body_excerpt"]
+```
+
+This gives the validator both the structured metadata (license number,
+rating, room counts) and the prose body (descriptions, amenity lists).
+A number you cite in your rewrite must appear in one of these.

@@ -132,6 +132,28 @@ class SiteParser:
 
 
 @dataclass(frozen=True)
+class SiteVoiceValidation:
+    """Machine-checkable subset of the voice calibration doc.
+
+    Loaded by mcp_betty_validate_against_voice. The voice doc itself
+    remains authoritative for tone, examples, and human-judgment rules;
+    this block contains only the deterministic checks (banned words,
+    banned openers, ban-flags, number-grounding) the validator can
+    enforce mechanically.
+
+    Keep this in sync with the voice doc — if §1 Rule 7's banned-word
+    list changes in the doc, update banned_words here too.
+    """
+    enabled: bool
+    check_fields: tuple[str, ...]
+    banned_words: tuple[str, ...]
+    banned_openers: tuple[str, ...]
+    ban_first_person_singular: bool
+    ban_owner_attribution: bool
+    check_numbers_against_source: bool
+
+
+@dataclass(frozen=True)
 class SiteConfig:
     """Validated site configuration."""
     id: str
@@ -143,6 +165,7 @@ class SiteConfig:
     collections: dict[str, SiteCollection]
     hard_rules: tuple[str, ...]
     voice_doc_path: str | None  # Optional: empty/missing = no voice doc yet
+    voice_validation: SiteVoiceValidation | None  # Optional
     parsers: dict[str, SiteParser]
 
     # ---- derived helpers -------------------------------------------------
@@ -355,6 +378,24 @@ def _parse_site_config(raw: dict, source_path: Path) -> SiteConfig:
     voice_doc_raw = raw.get("voice_doc_path")
     voice_doc_path: str | None = str(voice_doc_raw) if voice_doc_raw else None
 
+    # voice_validation: optional. Sites that haven't yet declared rules get
+    # no validation; mcp_betty_validate_against_voice will return that
+    # validation is unavailable for them.
+    vv_raw = raw.get("voice_validation")
+    voice_validation: SiteVoiceValidation | None
+    if vv_raw and isinstance(vv_raw, dict) and vv_raw.get("enabled"):
+        voice_validation = SiteVoiceValidation(
+            enabled=bool(vv_raw.get("enabled", False)),
+            check_fields=tuple(str(f) for f in vv_raw.get("check_fields", [])),
+            banned_words=tuple(str(w) for w in vv_raw.get("banned_words", [])),
+            banned_openers=tuple(str(o) for o in vv_raw.get("banned_openers", [])),
+            ban_first_person_singular=bool(vv_raw.get("ban_first_person_singular", False)),
+            ban_owner_attribution=bool(vv_raw.get("ban_owner_attribution", False)),
+            check_numbers_against_source=bool(vv_raw.get("check_numbers_against_source", False)),
+        )
+    else:
+        voice_validation = None
+
     return SiteConfig(
         id=site_id,
         domain=str(raw["domain"]),
@@ -365,6 +406,7 @@ def _parse_site_config(raw: dict, source_path: Path) -> SiteConfig:
         collections=collections,
         hard_rules=tuple(hard_rules_raw),
         voice_doc_path=voice_doc_path,
+        voice_validation=voice_validation,
         parsers=parsers,
     )
 

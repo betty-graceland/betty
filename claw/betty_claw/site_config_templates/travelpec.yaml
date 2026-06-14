@@ -113,6 +113,46 @@ hard_rules:
 voice_doc_path: "02-voice/03-voice-calibration.md"
 
 # ---------------------------------------------------------------------------
+# Voice validation (machine-checked subset of the voice doc)
+# ---------------------------------------------------------------------------
+# Deterministic checks Betty runs via mcp_betty_validate_against_voice
+# after rewriting and before writing a draft. The voice doc is
+# authoritative for what travelpec.com sounds like; this block is what we
+# can verify mechanically. Keep the two in sync — when the doc's §1
+# Rule 7 list changes, update banned_words here too.
+voice_validation:
+  enabled: true
+  check_fields:
+    - description
+    - persona
+  banned_words:
+    - stunning
+    - luxurious
+    - incredible
+    - perfect
+    - amazing
+    - breathtaking
+    - charming
+    - quaint
+    - vibrant
+    - authentic
+    - cozy
+    - dreamy
+    - magical
+    - picture-perfect
+    - hidden gem
+    - bucket list
+  banned_openers:
+    - Escape
+    - Welcome
+    - Looking for
+    - If you've ever
+    - If you ever
+  ban_first_person_singular: true
+  ban_owner_attribution: true
+  check_numbers_against_source: true
+
+# ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
 # Parser-specific config. Each parser has its own block.

@@ -88,6 +88,10 @@ from betty_claw.tools.git_ops import (
     git_diff as _git_diff,
     git_status as _git_status,
 )
+from betty_claw.tools.voice_validation import (
+    validate_text as _validate_text,
+    violation_to_dict as _violation_to_dict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +568,119 @@ def emdash_list_taxonomy_terms(
 
 
 # ---------------------------------------------------------------------------
+# Voice validation tool (Phase 1.7 — deterministic post-process check)
+# ---------------------------------------------------------------------------
+# Betty calls this AFTER rewriting text and BEFORE create_content_draft.
+# The same checks also run automatically inside emdash_create_content_draft
+# as a structural gate — so even if Betty skips the explicit call, a
+# violating draft cannot reach EmDash.
+
+@mcp.tool()
+def validate_against_voice(
+    site: str,
+    text: str,
+    source_text: str = "",
+) -> dict[str, Any]:
+    """Check `text` against the named site's voice validation rules.
+
+    Returns a structured violation list. If empty, the text is compliant
+    and ready to write. If not empty, fix each violation (each has a
+    rule, the offending substring, a position, and an explanation) and
+    re-validate before writing.
+
+    The check is mechanical — banned words, banned openers, first-person
+    singular, owner attribution, and numbers in `text` that don't appear
+    in `source_text`. Source-grounded judgment (tone, editorial framing,
+    multi-night recommendations) is still Betty's responsibility per the
+    voice doc.
+
+    Args:
+        site: site_id slug.
+        text: The rewritten text to validate (typically a description
+            or persona field from a content draft).
+        source_text: The original source the rewrite is grounded in
+            (typically the parsed dossier's body_excerpt + frontmatter
+            stringified). Used for the number-grounding check. Pass
+            empty string if not relevant; the number check will then
+            flag every number as ungrounded.
+
+    Returns:
+        Dict with:
+          - compliant: bool — true if zero violations.
+          - violations: list of {rule, match, position, explanation}.
+          - summary: human-readable one-liner.
+    """
+    logger.info(
+        "validate_against_voice called with site=%r, text len=%d, source len=%d",
+        site, len(text), len(source_text),
+    )
+    config = load_site_config(site)
+    if not config.voice_validation or not config.voice_validation.enabled:
+        return {
+            "compliant": True,
+            "violations": [],
+            "summary": (
+                f"Site {site!r} has no voice_validation block enabled. "
+                f"Skipping mechanical check; rely on voice doc judgment."
+            ),
+        }
+    violations = _validate_text(text, source_text, config.voice_validation)
+    return {
+        "compliant": len(violations) == 0,
+        "violations": [_violation_to_dict(v) for v in violations],
+        "summary": (
+            f"{len(violations)} violation(s) found in text "
+            f"({len(text)} chars)."
+            if violations
+            else f"Compliant: text passes all {site!r} voice rules."
+        ),
+    }
+
+
+def _enforce_voice_validation(
+    config: Any,
+    collection: str,
+    data: dict[str, Any],
+    source_text: str = "",
+) -> None:
+    """Raise ValueError if any check_field in `data` violates voice rules.
+
+    Called from emdash_create_content_draft and emdash_update_content_draft
+    as a structural gate: drafts that violate voice rules cannot reach
+    EmDash even if Betty skipped the explicit validate_against_voice call.
+    """
+    vv = config.voice_validation
+    if vv is None or not vv.enabled:
+        return
+    all_violations: list[dict[str, Any]] = []
+    for field_name in vv.check_fields:
+        if field_name not in data:
+            continue
+        text = data[field_name]
+        if not isinstance(text, str):
+            continue
+        violations = _validate_text(text, source_text, vv)
+        for v in violations:
+            all_violations.append({
+                "field": field_name,
+                **_violation_to_dict(v),
+            })
+    if all_violations:
+        # Surface as a structured ValueError that FastMCP wraps as a
+        # tool error back to Betty. Each violation lists field, rule,
+        # match, and explanation so she can self-correct without
+        # re-running the validator.
+        first = all_violations[0]
+        summary = (
+            f"Voice validation blocked the write: {len(all_violations)} "
+            f"violation(s) across {len({v['field'] for v in all_violations})} "
+            f"field(s). First: {first['field']}.{first['rule']}="
+            f"{first['match']!r} — {first['explanation']}"
+        )
+        raise ValueError(summary)
+
+
+# ---------------------------------------------------------------------------
 # EmDash write tools (risk_class=reversible_write; draft-only for Phase 1.5)
 # ---------------------------------------------------------------------------
 # Three write tools, all draft-only. The Judge layer (Phase 2) is not in
@@ -604,6 +721,7 @@ def emdash_create_content_draft(
     collection: str,
     data: dict[str, Any],
     slug: str | None = None,
+    source_text: str = "",
 ) -> dict[str, Any]:
     """Create a new content item as a DRAFT in the named site's EmDash.
 
@@ -612,8 +730,12 @@ def emdash_create_content_draft(
     EmDash UI. Phase 1.5 deliberately does not expose a publish tool.
 
     Field values in `data` are validated against the site's declared
-    collection schema (from ~/.betty/sites/{site}.yaml) before the write
-    hits EmDash. Unknown fields and missing required fields are rejected.
+    collection schema before the write hits EmDash. If the site has a
+    voice_validation block enabled (Phase 1.7), each `check_fields` entry
+    in `data` is ALSO checked against the voice rules — drafts that
+    violate banned-word, opener, or hallucinated-number rules cannot
+    reach EmDash. Betty should call validate_against_voice first and
+    self-correct; this is a structural backstop.
 
     Args:
         site: site_id slug (e.g., "travelpec").
@@ -621,6 +743,10 @@ def emdash_create_content_draft(
         data: Field values matching the collection schema.
         slug: Optional URL slug. If omitted, EmDash auto-generates one
             from the title.
+        source_text: Optional source text for the voice validation
+            number-grounding check. For Airbnb dossier flows, pass the
+            concatenation of parsed `frontmatter` and `body_excerpt`. If
+            omitted, the number-grounding check will flag every number.
 
     Returns:
         Dict containing `data` (the EmDash response with new item ID,
@@ -630,10 +756,13 @@ def emdash_create_content_draft(
     """
     logger.info(
         "emdash_create_content_draft called with site=%r, collection=%r, "
-        "slug=%r, data keys=%r",
-        site, collection, slug, sorted(data.keys()) if isinstance(data, dict) else "?",
+        "slug=%r, data keys=%r, source_text len=%d",
+        site, collection, slug,
+        sorted(data.keys()) if isinstance(data, dict) else "?",
+        len(source_text),
     )
     config, collection_schema = _collection_schema_for(site, collection)
+    _enforce_voice_validation(config, collection, data, source_text)
     args: dict[str, Any] = {"collection": collection, "data": data}
     if slug is not None:
         args["slug"] = slug
@@ -651,6 +780,7 @@ def emdash_update_content_draft(
     id: str,
     data: dict[str, Any],
     rev: str | None = None,
+    source_text: str = "",
 ) -> dict[str, Any]:
     """Update fields on an existing content item in the named site's EmDash.
 
@@ -661,6 +791,11 @@ def emdash_update_content_draft(
     `_rev` from a recent emdash_get_content call to detect concurrent
     modifications and avoid silent overwrites.
 
+    If the site has voice_validation enabled and `data` includes any
+    check_fields (e.g., description, persona), the new values are
+    voice-checked before EmDash is touched. Pass `source_text` so the
+    number-grounding rule can verify any numbers in your update.
+
     Args:
         site: site_id slug.
         collection: Collection slug; must be declared in the site YAML.
@@ -668,14 +803,18 @@ def emdash_update_content_draft(
         data: Fields to change. Must match the collection schema; unknown
             keys rejected.
         rev: Optional optimistic-concurrency token.
+        source_text: Optional source text for voice validation
+            number-grounding check.
     """
     logger.info(
         "emdash_update_content_draft called with site=%r, collection=%r, "
-        "id=%r, rev=%r, data keys=%r",
+        "id=%r, rev=%r, data keys=%r, source_text len=%d",
         site, collection, id, rev,
         sorted(data.keys()) if isinstance(data, dict) else "?",
+        len(source_text),
     )
     config, collection_schema = _collection_schema_for(site, collection)
+    _enforce_voice_validation(config, collection, data, source_text)
     args: dict[str, Any] = {
         "collection": collection,
         "id": id,
@@ -778,8 +917,9 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 16 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 17 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
+        "validate_against_voice, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms, "
