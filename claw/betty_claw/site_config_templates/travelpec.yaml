@@ -106,16 +106,11 @@ hard_rules:
 # ---------------------------------------------------------------------------
 # Voice
 # ---------------------------------------------------------------------------
-# Optional. Path is relative to the docs root above. Leave empty (or omit
-# the field entirely) until a real voice calibration doc has been written.
-#
-# TODO 2026-05-31: travelpec.com voice doc has not been written yet. The
-# docs root has no 02-voice/ folder. The Phase 4.6.2 actor was wired to a
-# path that doesn't exist on disk. Write a real voice calibration doc
-# (editorial-we, multi-night framing, off-season emphasis, village-deep
-# focus per the v3 BRIEF) before the first content-generation tool tries
-# to load it.
-voice_doc_path: ""
+# Path is relative to the docs root above. The voice doc instructs Betty
+# how to write editorial content for this site — hard rules,
+# source-grounding constraints, terminology, worked rewrite examples.
+# Betty reads this file at the start of any content composition task.
+voice_doc_path: "02-voice/03-voice-calibration.md"
 
 # ---------------------------------------------------------------------------
 # Parsers
