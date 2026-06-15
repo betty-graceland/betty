@@ -51,11 +51,13 @@ Run via:
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -955,6 +957,154 @@ def emdash_create_taxonomy_term(
 
 
 # ---------------------------------------------------------------------------
+# Worklist discovery (Phase 2.0 Step 1)
+# ---------------------------------------------------------------------------
+# Prerequisite for Kanban autonomous dispatch: a tool that returns the
+# set of Airbnb dossiers not yet present in EmDash as Stays drafts.
+# Cross-references files on disk against EmDash content_list results
+# by outbound_url match — the dossier's `url:` frontmatter field is the
+# stable identity for an Airbnb listing across both sides.
+
+_DOSSIER_URL_PATTERN = re.compile(r"^url:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _extract_url_from_dossier(path: Path) -> str | None:
+    """Read just the frontmatter of a dossier and return its url: value.
+
+    Cheap operation — reads at most 40 lines (frontmatter is bounded by
+    the second `---` line and is always near the top). Used by the
+    worklist tool to fingerprint dossiers without paying the full
+    parse_airbnb_dossier cost just to identify them.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = []
+            for i, line in enumerate(f):
+                lines.append(line)
+                if i > 50:
+                    break
+            head = "".join(lines)
+    except OSError:
+        return None
+    m = _DOSSIER_URL_PATTERN.search(head)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+@mcp.tool()
+def list_pending_airbnb_dossiers(site: str) -> dict[str, Any]:
+    """Return the set of Airbnb dossiers not yet drafted into EmDash.
+
+    Walks {site.paths.research}/01-source-data/research/airbnb-listings/
+    and lists every .md file. Calls emdash_list_content for the Stays
+    collection. Matches each dossier's `url:` frontmatter field against
+    Stays entries' outbound_url field. Dossiers whose URL doesn't appear
+    in EmDash are returned as `pending` — these are what a Kanban
+    autonomous run would dispatch.
+
+    Note: the match is strict equality on the URL string. If Airbnb
+    canonicalizes URLs (e.g., adding tracking params), the dossier will
+    appear pending even though there's a draft. If that becomes a
+    problem, normalize URLs on both sides before matching.
+
+    Args:
+        site: site_id slug.
+
+    Returns:
+        Dict with:
+          - pending: list of {dossier_path, dossier_filename, url}
+            for dossiers without a corresponding Stays entry.
+          - published: list of {dossier_path, dossier_filename, url,
+            stays_id} for dossiers that have one.
+          - skipped: list of {dossier_path, reason} for files we could
+            not parse a URL from.
+          - counts: summary {pending, published, skipped, total}.
+    """
+    logger.info("list_pending_airbnb_dossiers called with site=%r", site)
+    config = load_site_config(site)
+    dossier_dir = config.paths.research / "01-source-data" / "research" / "airbnb-listings"
+    if not dossier_dir.exists():
+        raise ValueError(
+            f"Dossier directory not found: {dossier_dir}. Check "
+            f"site.paths.research and that 01-source-data/research/"
+            f"airbnb-listings/ exists under it."
+        )
+
+    # Build set of URLs already present as Stays in EmDash. Paginate to
+    # be safe — Stays collection can grow past one page eventually.
+    client = _emdash_client_for_site(site)
+    published_by_url: dict[str, str] = {}  # url -> stays_id
+    cursor: str | None = None
+    while True:
+        args: dict[str, Any] = {"collection": "stays", "limit": 100}
+        if cursor:
+            args["cursor"] = cursor
+        result = _emdash_list_content(args, client=client)
+        data = result.payload.get("data") or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_data = item.get("data") or item
+            if isinstance(item_data, dict):
+                url = item_data.get("outbound_url")
+                if isinstance(url, str) and url.strip():
+                    published_by_url[url.strip()] = str(item.get("id", "(unknown)"))
+        next_cursor = data.get("nextCursor") if isinstance(data, dict) else None
+        if not next_cursor:
+            break
+        cursor = next_cursor
+
+    # Enumerate dossiers on disk.
+    pending: list[dict[str, str]] = []
+    published: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for dossier_path in sorted(dossier_dir.glob("*.md")):
+        url = _extract_url_from_dossier(dossier_path)
+        if not url:
+            skipped.append({
+                "dossier_path": str(dossier_path),
+                "dossier_filename": dossier_path.name,
+                "reason": "Could not extract `url:` from frontmatter.",
+            })
+            continue
+        if url in published_by_url:
+            published.append({
+                "dossier_path": str(dossier_path),
+                "dossier_filename": dossier_path.name,
+                "url": url,
+                "stays_id": published_by_url[url],
+            })
+        else:
+            pending.append({
+                "dossier_path": str(dossier_path),
+                "dossier_filename": dossier_path.name,
+                "url": url,
+            })
+
+    total = len(pending) + len(published) + len(skipped)
+    logger.info(
+        "list_pending_airbnb_dossiers: %d pending, %d published, "
+        "%d skipped (total %d) for site=%r",
+        len(pending), len(published), len(skipped), total, site,
+    )
+    return {
+        "pending": pending,
+        "published": published,
+        "skipped": skipped,
+        "counts": {
+            "pending": len(pending),
+            "published": len(published),
+            "skipped": len(skipped),
+            "total": total,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Composed workflow: Airbnb dossier → Stays draft (Phase 1.9)
 # ---------------------------------------------------------------------------
 # Two-call atomic workflow. begin parses + caches state server-side and
@@ -1304,9 +1454,10 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 20 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 21 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
         "validate_against_voice, score_editorial_quality, "
+        "list_pending_airbnb_dossiers, "
         "compose_stays_draft_begin, compose_stays_draft_publish, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
