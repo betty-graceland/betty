@@ -33,10 +33,28 @@ load_dotenv(_ENV_PATH)
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 
-# Opus 4.7 pricing. Adjust here if Anthropic changes rates.
-# $15.00 / 1M input tokens, $75.00 / 1M output tokens.
-INPUT_COST_PER_MTOK = 15.00
-OUTPUT_COST_PER_MTOK = 75.00
+# Model pricing in USD per 1M tokens. Lookup keys are prefix matches
+# against the model id (e.g., "claude-opus-4" matches both "claude-opus-4"
+# and "claude-opus-4-6"). Order from most-specific to least-specific so
+# the matcher picks the right family.
+#
+# Phase 4.5 (Opus Judge) uses claude-opus-4-* at $15 input / $75 output.
+# Phase 2 (Haiku editorial scorer) uses claude-haiku-4-* at $1 / $5.
+_MODEL_PRICING: list[tuple[str, float, float]] = [
+    # (model_prefix, input_per_mtok_usd, output_per_mtok_usd)
+    ("claude-opus-4", 15.00, 75.00),
+    ("claude-sonnet-4", 3.00, 15.00),
+    ("claude-haiku-4", 1.00, 5.00),
+    # Older naming kept for back-compat with any existing env vars.
+    ("claude-3-opus", 15.00, 75.00),
+    ("claude-3-5-sonnet", 3.00, 15.00),
+    ("claude-3-haiku", 0.25, 1.25),
+]
+
+# Default pricing if the model id doesn't match any prefix above.
+# Errs on the safe side (Opus pricing) so cost estimates don't undercount.
+_FALLBACK_INPUT_PER_MTOK = 15.00
+_FALLBACK_OUTPUT_PER_MTOK = 75.00
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +96,27 @@ class AnthropicResponse:
 # Cost computation
 # ---------------------------------------------------------------------------
 
-def _compute_cost(input_tokens: int, output_tokens: int) -> float:
-    """Cost in USD for an Opus 4.7 call given token counts.
+def _lookup_pricing(model: str) -> tuple[float, float]:
+    """Find input/output per-MTok pricing for `model` via prefix match.
 
-    Float precision is fine — this feeds a $5/day operational cap, not
-    accounting. See Stage 4 design note in types.py.
+    Returns the fallback Opus rate if no prefix matches — over-estimating
+    cost is safer than under-estimating when feeding a spend cap.
     """
-    input_cost = (input_tokens / 1_000_000) * INPUT_COST_PER_MTOK
-    output_cost = (output_tokens / 1_000_000) * OUTPUT_COST_PER_MTOK
+    for prefix, in_price, out_price in _MODEL_PRICING:
+        if model.startswith(prefix):
+            return in_price, out_price
+    return _FALLBACK_INPUT_PER_MTOK, _FALLBACK_OUTPUT_PER_MTOK
+
+
+def _compute_cost(input_tokens: int, output_tokens: int, model: str) -> float:
+    """Cost in USD for one Anthropic call given token counts and model.
+
+    Float precision is fine — this feeds an operational spend cap, not
+    accounting.
+    """
+    in_per_mtok, out_per_mtok = _lookup_pricing(model)
+    input_cost = (input_tokens / 1_000_000) * in_per_mtok
+    output_cost = (output_tokens / 1_000_000) * out_per_mtok
     return input_cost + output_cost
 
 
@@ -182,7 +213,7 @@ class AnthropicClient:
                 f"Malformed response body: {e!r} | body={str(data)[:500]}"
             ) from e
 
-        cost_usd = _compute_cost(input_tokens, output_tokens)
+        cost_usd = _compute_cost(input_tokens, output_tokens, model)
 
         return AnthropicResponse(
             content=content,

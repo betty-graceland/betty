@@ -49,7 +49,23 @@ must not be submitted.
    amazing, breathtaking, charming, quaint, vibrant, authentic,
    cozy, dreamy, magical, picture-perfect, hidden gem, bucket list.
 
-8. **Pass through internal flags untouched.** The data layer may
+8. **No atmospheric editorial invention.** Even when the source has
+   no specific atmospheric facts to ground a flourish, do not invent
+   atmosphere. Phrases that fabricate vibe or sensory experience
+   without source support are forbidden, including but not limited to:
+   "has no rivals," "second to none," "step back in time," "ideal for,"
+   "perfect for," "highly recommended," "highly rated," "guests love,"
+   "go-to list," "memories that will last," "everything you need,"
+   "the perfect," "world-class," "one-of-a-kind," "unforgettable,"
+   "escape to," "retreat to," "paradise." These phrases are flagged
+   mechanically by the voice validator AND violate Rule 1 even when
+   they don't claim specific facts.
+
+   When you find yourself wanting to add atmospheric language to make
+   a sparse description feel "more editorial," resist. The sparse
+   description is the correct output. See §5 Example 3.
+
+9. **Pass through internal flags untouched.** The data layer may
    contain fields marked as internal. Do not reference internal
    field names, statuses, or flags in any public-facing description.
 
@@ -246,13 +262,13 @@ Before returning your draft, verify each item:
 
 If any answer requires a fix, revise and re-check before submitting.
 
-## 8. Required validation workflow (Phase 1.7)
+## 8. Required validation workflow
 
 Before calling `mcp_betty_emdash_create_content_draft` or
-`mcp_betty_emdash_update_content_draft`, you MUST call
-`mcp_betty_validate_against_voice` and fix any violations it returns.
+`mcp_betty_emdash_update_content_draft`, run the two-layer validation
+loop below. Both layers are required.
 
-### The validation loop
+### Layer 1 — mechanical (deterministic regex checks)
 
 1. Rewrite the description (or any field in `check_fields`) following
    the rules above.
@@ -260,30 +276,53 @@ Before calling `mcp_betty_emdash_create_content_draft` or
    where `text` is your rewritten field and `source_text` is the
    concatenation of the parsed `frontmatter` and `body_excerpt` from
    `parse_airbnb_dossier`.
-3. If the response has `compliant: true`, proceed to write.
-4. If the response has `compliant: false`, read the `violations` list.
-   Each violation has a `rule`, the offending `match` string, a
-   `position` in your text, and an `explanation`. Fix all violations
-   in your text.
-5. Re-call validate. Repeat until compliant.
-6. Only then call `mcp_betty_emdash_create_content_draft`.
+3. If `compliant: true`, move to Layer 2.
+4. If `compliant: false`, read the `violations` list. Each violation
+   has a `rule`, the offending `match`, a `position`, and an
+   `explanation`. Fix all of them in your text.
+5. Re-call. Repeat until compliant or until you've iterated 3 times.
+
+### Layer 2 — semantic (LLM-as-judge)
+
+6. Call `mcp_betty_score_editorial_quality(site, text, source_text)`
+   with the same text that passed Layer 1.
+7. If `score >= 8` with an empty `violations` list, proceed to write.
+8. If `score >= 8` with non-empty `violations`, the rewrite is close
+   but has flaggable issues — fix the highest-impact violations and
+   re-call (back to Layer 1, then Layer 2).
+9. If `5 <= score < 8`, the rewrite needs revision. Read every
+   violation, fix the patterns, restart from Layer 1.
+10. If `score < 5`, restart your rewrite from the parsed source. The
+    current draft has too much invention or marketing voice to fix
+    incrementally.
+
+### Stop condition (uncertainty handoff)
+
+If after 3 full iterations of Layers 1+2 you still cannot land a
+compliant rewrite with `score >= 8`, STOP. Do not call
+`emdash_create_content_draft`. Surface the current state to Peter
+with: the current rewrite, the last validation result, the last
+editorial score, and a one-sentence statement of which violation
+type you cannot resolve. Bounded escalation with structured context
+is correct; spinning indefinitely is not.
 
 ### Backstop
 
-The write tools also run validation automatically. If you skip the
-explicit `validate_against_voice` call, the write tool will refuse
-non-compliant drafts and return the first violation. You will have
-wasted a tool call. The explicit validate-first loop is faster
-because you see the full list of violations at once.
+The write tools also run mechanical validation automatically. If
+you skip Layer 1, the write tool will refuse non-compliant drafts.
+Layer 2 is currently advisory at the write tool — it does not block
+— because Peter reviews drafts in EmDash before publish and the
+human-in-the-loop is the final eval gate.
 
 ### What to pass as source_text
 
-For `parse_airbnb_dossier` output, pass:
+For `parse_airbnb_dossier` output:
 
 ```
 source_text = str(payload["frontmatter"]) + "\n" + payload["body_excerpt"]
 ```
 
-This gives the validator both the structured metadata (license number,
-rating, room counts) and the prose body (descriptions, amenity lists).
-A number you cite in your rewrite must appear in one of these.
+This gives both layers the structured metadata (license number,
+room counts) and the prose body (descriptions, amenity lists). A
+number or specific phrase you cite in your rewrite must appear in
+one of these.

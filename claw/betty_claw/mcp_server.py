@@ -92,6 +92,10 @@ from betty_claw.tools.voice_validation import (
     validate_text as _validate_text,
     violation_to_dict as _violation_to_dict,
 )
+from betty_claw.tools.editorial_scorer import (
+    editorial_score_to_dict as _editorial_score_to_dict,
+    score_editorial_quality as _score_editorial_quality,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +641,80 @@ def validate_against_voice(
     }
 
 
+@mcp.tool()
+def score_editorial_quality(
+    site: str,
+    text: str,
+    source_text: str,
+) -> dict[str, Any]:
+    """Semantic editorial-quality scorer for travelpec.com voice (Phase 2).
+
+    Calls Claude (Haiku by default) to evaluate `text` against the voice
+    calibration's qualitative rules — the ones the deterministic
+    validate_against_voice tool can't see: atmospheric editorial
+    invention, distance inference, capacity inference, marketing voice,
+    generic filler, inverted emphasis.
+
+    Use this AFTER validate_against_voice returns compliant. The two
+    layers are complementary: mechanical first (cheap, catches the
+    bulk of violations), semantic second (catches what the regex
+    misses). Treat score >= 8 as ready-to-publish, 5-7 as needs-revision,
+    < 5 as restart-from-source.
+
+    Args:
+        site: site_id slug. Used for logging context; the rubric is
+            travelpec-specific in the current implementation.
+        text: The rewritten description to score.
+        source_text: The raw source the rewrite is derived from. Pass
+            the parsed dossier's frontmatter + body_excerpt for Airbnb
+            content; the model uses this to detect inference vs.
+            grounding.
+
+    Returns:
+        Dict with:
+          - score: int 0-10
+          - violations: list of {category, passage, explanation}
+          - summary: one-sentence verdict
+          - cost_usd: what this call cost
+          - model: which Anthropic model produced the score
+          - input_tokens / output_tokens: accounting for visibility
+    """
+    logger.info(
+        "score_editorial_quality called with site=%r, text len=%d, "
+        "source len=%d",
+        site, len(text), len(source_text),
+    )
+    try:
+        score = _score_editorial_quality(text=text, source_text=source_text)
+    except Exception as e:
+        # Editorial scoring failures should not block the workflow —
+        # surface as a structured error result instead of crashing the
+        # MCP tool. Betty can then choose to proceed with the
+        # deterministic validation result only.
+        logger.error("score_editorial_quality failed: %r", e)
+        return {
+            "score": None,
+            "violations": [],
+            "summary": (
+                f"Editorial scoring unavailable: {type(e).__name__}: {e}. "
+                f"Proceed with mechanical validation result only, or "
+                f"retry."
+            ),
+            "cost_usd": 0.0,
+            "model": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "error": True,
+        }
+    result = _editorial_score_to_dict(score)
+    logger.info(
+        "score_editorial_quality returning score=%d, %d violation(s), "
+        "cost=$%.6f",
+        score.score, len(score.violations), score.cost_usd,
+    )
+    return result
+
+
 def _enforce_voice_validation(
     config: Any,
     collection: str,
@@ -917,9 +995,9 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 17 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 18 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
-        "validate_against_voice, "
+        "validate_against_voice, score_editorial_quality, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms, "

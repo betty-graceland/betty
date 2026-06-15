@@ -126,6 +126,7 @@ voice_validation:
     - description
     - persona
   banned_words:
+    # Single-word marketing intensifiers (§1 Rule 7 original list)
     - stunning
     - luxurious
     - incredible
@@ -142,6 +143,33 @@ voice_validation:
     - picture-perfect
     - hidden gem
     - bucket list
+    # Atmospheric editorial invention patterns observed in Phase 1.7
+    # Route A test (Suite Spot draft) and Phase 1.5 (Chalet On The Bay).
+    # These don't violate Rule 1's source-grounding mechanically because
+    # they don't claim specific facts — but they invent atmosphere and
+    # editorial-voice flourishes the doc forbids. Mechanical block lets
+    # the validator catch them without a semantic scorer.
+    - has no rivals
+    - no rivals
+    - second to none
+    - step back in time
+    - ideal for
+    - perfect for
+    - highly recommended
+    - highly rated
+    - guests love
+    - guest favourite
+    - guest favorite
+    - go-to list
+    - memories that
+    - everything you need
+    - the perfect
+    - world-class
+    - one-of-a-kind
+    - unforgettable
+    - escape to
+    - retreat to
+    - paradise
   banned_openers:
     - Escape
     - Welcome
