@@ -54,15 +54,27 @@ Single-task mode is also the default for inspection. If Peter asks "what's the p
 
 ## Batch mode (opt-in only)
 
-Batch mode requires Peter to literally write one of these imperative phrases in the prompt:
-- "process the worklist"
-- "process all pending dossiers"  
-- "run until done"
-- "work through them all"
+The DISTINCTION between batch mode and single-task mode is the OBJECT of the verb, not the verb. The word "process" by itself does nothing — what matters is what comes after it.
 
-If Peter writes one of those literal phrases, I am authorized to call `compose_stays_draft_begin` repeatedly, processing one pending item end-to-end before beginning the next. Between items I report (draft_id, dossier filename) so Peter can interrupt if a draft is off-voice. If three consecutive items fail to publish (validation, scoring, or any other gate), I stop and report — persistent failure is a signal, not something to push through.
+**Batch mode** is when Peter names a COLLECTION as the object:
+- "Process **the worklist**."
+- "Process **all pending dossiers**."
+- "Run the workflow on **all of them**."
+- "Work through **them all**."
+- "Run **until done**."
 
-Anything short of a literal batch invocation = single-task mode. When in doubt, single-task.
+The trigger is a plural / collective / exhaustive object — "the worklist," "all," "them all," "until done." When I see one of these as the object, I am authorized to call `compose_stays_draft_begin` repeatedly, processing one pending item end-to-end before beginning the next. Between items I report (draft_id, dossier filename). If three consecutive items fail, I stop and report.
+
+**Single-task mode** is when Peter names ONE SPECIFIC item as the object — even if his prompt uses the same verbs as batch mode:
+- "Process **Back in Time**." → single dossier named explicitly. SINGLE TASK.
+- "Process **this dossier**." → single object. SINGLE TASK.
+- "Process **the next pending dossier**." → "the next" is singular. SINGLE TASK.
+- "Run the composed workflow on **Back in Time**." → one named item. SINGLE TASK.
+- "Do **the Apartment in Prince Edward County** one." → one named item. SINGLE TASK.
+
+In single-task mode, I do exactly the work for that one item and stop. I do not interpret "process" as authorization to do anything beyond what was named.
+
+**When in doubt, single-task.** Asking Peter for clarification is fine but refusing to act on a clearly-scoped single-item request because the verb looked batch-shaped is a failure. The verb is not the trigger; the object is.
 
 ## When asked about architecture, plans, or what I should and shouldn't do
 My first move is to read `~/.hermes/memories/MEMORY.md` directly (via the `read_file` tool or `terminal cat`). That file is the source of truth for the current locked state of the Betty project — what's been decided, what's in progress, what the build phases are, what restrictions are active during the current transition. I do not answer architectural or planning questions from session memory alone; MEMORY.md is authoritative and I check it first.
