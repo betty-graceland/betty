@@ -264,9 +264,17 @@ If any answer requires a fix, revise and re-check before submitting.
 
 ## 8. Required validation workflow
 
-Before calling `mcp_betty_emdash_create_content_draft` or
-`mcp_betty_emdash_update_content_draft`, run the two-layer validation
-loop below. Both layers are required.
+For Airbnb dossier → Stays draft, use the composed workflow tools
+documented in §9. They package this validation loop atomically and
+keep the parsed dossier state in the MCP server so you don't have to
+carry it in your own context.
+
+The general validation rules below still apply — to any content draft,
+not just Stays from dossiers. If you ever call
+`mcp_betty_emdash_create_content_draft` or
+`mcp_betty_emdash_update_content_draft` directly (without the composed
+tools), run the two-layer validation loop below. Both layers are
+required.
 
 ### Layer 1 — mechanical (deterministic regex checks)
 
@@ -326,3 +334,72 @@ This gives both layers the structured metadata (license number,
 room counts) and the prose body (descriptions, amenity lists). A
 number or specific phrase you cite in your rewrite must appear in
 one of these.
+
+## 9. Composed workflow for Airbnb dossiers — preferred path
+
+The composed tools — `mcp_betty_compose_stays_draft_begin` and
+`mcp_betty_compose_stays_draft_publish` — are the preferred way to
+turn an Airbnb dossier into a Stays draft. They handle parsing,
+state management, source_text computation, and the final write in
+two atomic calls. The MCP server holds the parsed state between
+calls under an opaque token, so you don't have to carry the full
+parsed dict in your own context.
+
+### The flow
+
+1. Call `mcp_betty_compose_stays_draft_begin(site, dossier_path)`.
+   The response gives you:
+   - `token` — a short string. Remember it. Treat as opaque.
+   - `source_text` — pass to validate_against_voice and
+     score_editorial_quality.
+   - `parsed_description` — the parser's raw description. Your
+     starting point for rewriting.
+   - `body_excerpt` — cruft-stripped body, your source of truth
+     for facts.
+   - `parsed_data_summary` — confirms what fields the draft will
+     contain.
+
+2. Rewrite the description following §1-§8 rules. Use `body_excerpt`
+   and the frontmatter summary as your only source material. Do not
+   invent facts not present in those.
+
+3. Call `mcp_betty_validate_against_voice(site, text=YOUR_REWRITE,
+   source_text=THE_SOURCE_TEXT_FROM_STEP_1)`. If not compliant, fix
+   each violation and re-call. Cap at 3 iterations.
+
+4. Call `mcp_betty_score_editorial_quality(site, text=YOUR_REWRITE,
+   source_text=THE_SOURCE_TEXT_FROM_STEP_1)`. If `score >= 8` with
+   empty violations, proceed to step 5. If score is 5-7 or violations
+   is non-empty, fix the patterns and restart from step 3. Cap at 3
+   full iterations.
+
+5. Call `mcp_betty_compose_stays_draft_publish(token=THE_TOKEN_FROM_STEP_1,
+   description=YOUR_FINAL_REWRITE)`. The response gives you the new
+   draft's ID and title.
+
+### What this changes vs. calling tools directly
+
+You make 4-6 tool calls total instead of 7+. The parsed dossier
+dict, fixed_fields, source_text, and frontmatter live in the MCP
+server's cache keyed by your token. You only need to carry the
+token string and your current draft in your own context. This
+matters because long iteration loops fill context quickly and
+losing the parsed state mid-workflow is the failure mode the
+composed tools exist to prevent.
+
+### Stop condition
+
+If after 3 full validate+score iterations you cannot reach
+`score >= 8`, STOP. Do not call publish. Report the current state
+with: the current rewrite, the last validation result, the last
+editorial score, and a one-sentence statement of which violation
+type you cannot resolve. Bounded escalation with structured context
+is correct; spinning indefinitely is not.
+
+### Token lifetime
+
+Tokens expire 30 minutes after `begin` is called. If you take
+longer than that, publish returns an error and you must restart
+from begin. Tokens are also single-use — once publish succeeds,
+the token is invalidated. Re-publishing the same dossier means
+calling begin again.

@@ -52,6 +52,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
+import uuid
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -947,6 +950,285 @@ def emdash_create_taxonomy_term(
 
 
 # ---------------------------------------------------------------------------
+# Composed workflow: Airbnb dossier → Stays draft (Phase 1.9)
+# ---------------------------------------------------------------------------
+# Two-call atomic workflow. begin parses + caches state server-side and
+# returns a token; publish accepts the token + Betty's rewritten
+# description and writes the draft.
+#
+# Why this exists: Qwen3.5-35B under Hermes loses track of parsed dossier
+# state when its context fills with validate/score iteration turns. Moving
+# the heavy state (full parsed_data dict, source_text, fixed_fields) into
+# the MCP server and giving Betty a token reduces her cognitive load to
+# "remember this short string." Validate and score remain stateless tools
+# Betty calls between begin and publish; her iteration loop is unchanged
+# in shape, just lighter on context.
+
+@dataclass(frozen=True)
+class _ComposeState:
+    """One in-flight Stays compose session.
+
+    Stored in the server-side cache for up to _COMPOSE_STATE_TTL_SECONDS.
+    All fields needed to atomically publish without re-parsing the
+    dossier or re-loading site config.
+    """
+    site: str
+    dossier_filename: str
+    parsed_data: dict[str, Any]
+    source_text: str
+    body_excerpt: str
+    frontmatter: dict[str, Any]
+    created_at: float
+
+
+_compose_state_cache: dict[str, _ComposeState] = {}
+
+# TTL: long enough for an unhurried iteration loop with multiple
+# rewrite passes; short enough that abandoned sessions get reaped.
+_COMPOSE_STATE_TTL_SECONDS = 30 * 60
+
+
+def _prune_compose_state() -> None:
+    """Drop expired entries. Called at the start of begin/publish.
+
+    Cheap O(n) scan since the cache rarely holds more than a handful
+    of in-flight sessions. If it ever grows, switch to a heap-keyed
+    expiry queue.
+    """
+    now = time.time()
+    expired = [
+        token for token, state in _compose_state_cache.items()
+        if now - state.created_at > _COMPOSE_STATE_TTL_SECONDS
+    ]
+    for token in expired:
+        del _compose_state_cache[token]
+    if expired:
+        logger.info("Pruned %d expired compose state(s)", len(expired))
+
+
+@mcp.tool()
+def compose_stays_draft_begin(site: str, dossier_path: str) -> dict[str, Any]:
+    """Atomic step 1 of the Airbnb dossier → Stays draft workflow.
+
+    Parses the dossier under the site's read-allowed roots, computes the
+    source_text Betty needs for validate_against_voice and
+    score_editorial_quality, caches the full parsed state server-side,
+    and returns a short token + the materials Betty needs to compose
+    her rewrite.
+
+    After this call, Betty's only state to remember is the `token`
+    string. She can iterate rewrites with mcp_betty_validate_against_voice
+    and mcp_betty_score_editorial_quality as long as she likes — those
+    tools are stateless. When her rewrite is ready, she calls
+    compose_stays_draft_publish with the token + final description.
+
+    Token TTL is 30 minutes. After that the cache evicts the entry and
+    publish will return a clear "expired" error; Betty must restart
+    from begin.
+
+    Args:
+        site: site_id slug. Currently must be "travelpec" — the workflow
+            is parser-specific and only travelpec has a configured
+            airbnb_dossier parser in Phase 1.9.
+        dossier_path: Absolute or ~-prefixed path to the dossier .md file.
+            Must resolve under one of the site's read roots.
+
+    Returns:
+        Dict with:
+          - token: opaque UUID4 to pass to publish. Treat as opaque.
+          - source_text: precomputed string for validate/score calls.
+          - parsed_description: the parser's raw description field.
+            Use this as your starting point for editorial rewrite.
+          - body_excerpt: the parser's cruft-stripped body. Use to
+            verify facts when rewriting.
+          - parsed_data_summary: short human-readable summary of every
+            field the parser extracted, so you can confirm what the
+            draft will contain.
+          - frontmatter_keys: list of keys present in the source
+            frontmatter — useful for the number-grounding check
+            (numbers in those values are valid in your rewrite).
+          - instructions: short next-steps reminder.
+    """
+    logger.info(
+        "compose_stays_draft_begin called with site=%r, dossier_path=%r",
+        site, dossier_path,
+    )
+    _prune_compose_state()
+
+    config = load_site_config(site)
+    parser_cfg = config.parser("airbnb_dossier")
+    if not parser_cfg.target_collection:
+        raise ValueError(
+            f"Site {site!r}: parsers.airbnb_dossier.target_collection is "
+            f"not configured."
+        )
+    if parser_cfg.target_collection not in config.collections:
+        raise ValueError(
+            f"Site {site!r}: parsers.airbnb_dossier.target_collection="
+            f"{parser_cfg.target_collection!r} is not declared in "
+            f"collections."
+        )
+
+    result = _parse_airbnb_dossier(
+        {"path": dossier_path},
+        allowed_roots=config.read_roots,
+        fixed_fields=parser_cfg.fixed_fields,
+        target_collection_schema=config.collections[parser_cfg.target_collection],
+    )
+    payload = result.payload
+    parsed_data: dict[str, Any] = dict(payload["data"])
+    frontmatter: dict[str, Any] = dict(payload.get("frontmatter") or {})
+    body_excerpt: str = str(payload.get("body_excerpt") or "")
+    source_text = f"{frontmatter}\n{body_excerpt}"
+
+    # Generate a short token. UUID4 hex is 32 chars — terser than the
+    # full UUID and Hermes handles it cleanly in chat.
+    token = uuid.uuid4().hex
+
+    from pathlib import Path as _Path
+    dossier_filename = _Path(dossier_path).name
+
+    _compose_state_cache[token] = _ComposeState(
+        site=site,
+        dossier_filename=dossier_filename,
+        parsed_data=parsed_data,
+        source_text=source_text,
+        body_excerpt=body_excerpt,
+        frontmatter=frontmatter,
+        created_at=time.time(),
+    )
+    logger.info(
+        "compose_stays_draft_begin issued token %s for site=%r dossier=%r",
+        token, site, dossier_filename,
+    )
+
+    # Human-readable summary of every field the parser produced. Lets
+    # Betty confirm what the draft will contain without re-reading the
+    # full parsed_data dict.
+    summary_lines = []
+    for k, v in parsed_data.items():
+        v_str = str(v)
+        if len(v_str) > 80:
+            v_str = v_str[:77] + "..."
+        summary_lines.append(f"  {k}: {v_str}")
+    parsed_data_summary = "\n".join(summary_lines)
+
+    return {
+        "token": token,
+        "source_text": source_text,
+        "parsed_description": parsed_data.get("description", ""),
+        "body_excerpt": body_excerpt,
+        "parsed_data_summary": parsed_data_summary,
+        "frontmatter_keys": sorted(frontmatter.keys()),
+        "dossier_filename": dossier_filename,
+        "instructions": (
+            f"Token {token} holds the parsed dossier for {dossier_filename}. "
+            f"Rewrite the description following the voice rules. Use "
+            f"mcp_betty_validate_against_voice and mcp_betty_score_editorial_quality "
+            f"to iterate. When score >= 8 with empty violations, call "
+            f"mcp_betty_compose_stays_draft_publish(token, description). "
+            f"Token expires in 30 minutes."
+        ),
+    }
+
+
+@mcp.tool()
+def compose_stays_draft_publish(token: str, description: str) -> dict[str, Any]:
+    """Atomic step 2 of the Airbnb dossier → Stays draft workflow.
+
+    Recovers the cached parsed_data using `token`, replaces the
+    description field with Betty's rewritten version, and writes the
+    Stays draft to EmDash. Mechanical voice validation runs as a
+    structural backstop — non-compliant drafts cannot reach EmDash
+    even if Betty skipped explicit validation.
+
+    Args:
+        token: The token returned by compose_stays_draft_begin. Treat
+            as opaque. Expired tokens return a clear error; restart
+            from begin.
+        description: Betty's final rewritten description. This replaces
+            the parser's raw description in the data dict before write.
+
+    Returns:
+        Dict with:
+          - draft_id: EmDash item ID of the new draft.
+          - title: title field on the draft.
+          - dossier_filename: which dossier the draft came from.
+          - cost_summary: brief note on workflow cost.
+          - summary: human-readable confirmation.
+    """
+    logger.info(
+        "compose_stays_draft_publish called with token=%r, description len=%d",
+        token, len(description),
+    )
+    _prune_compose_state()
+
+    state = _compose_state_cache.get(token)
+    if state is None:
+        raise ValueError(
+            f"Token {token!r} not found in compose state cache. "
+            f"Either it expired (30-min TTL) or it was never issued. "
+            f"Restart from compose_stays_draft_begin."
+        )
+
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(
+            "compose_stays_draft_publish.description must be a non-empty "
+            "string."
+        )
+
+    config, collection_schema = _collection_schema_for(state.site, "stays")
+
+    # Merge Betty's rewrite into the parsed data. We make a fresh dict
+    # so the cache entry stays clean for any retries.
+    final_data = dict(state.parsed_data)
+    final_data["description"] = description
+
+    # Backstop: mechanical voice validation. If Betty skipped the
+    # explicit validate call, this catches non-compliant drafts before
+    # they hit EmDash. Source_text is the cached one — same string
+    # Betty validated against.
+    _enforce_voice_validation(
+        config, "stays", final_data, source_text=state.source_text,
+    )
+
+    client = _emdash_client_for_site(state.site)
+    result = _emdash_create_content_draft(
+        {"collection": "stays", "data": final_data},
+        client=client,
+        collection_schema=collection_schema,
+    )
+    response = result.payload.get("data") or {}
+    draft_id = (
+        response.get("id")
+        if isinstance(response, dict)
+        else None
+    ) or "(unknown)"
+    title = final_data.get("title", "(no title)")
+
+    # Evict the token after successful publish — single-use semantics
+    # so Betty can't accidentally publish the same dossier twice with
+    # the same token. (She can begin again on the same dossier if she
+    # really wants a second draft.)
+    _compose_state_cache.pop(token, None)
+    logger.info(
+        "compose_stays_draft_publish wrote draft_id=%s for dossier=%r",
+        draft_id, state.dossier_filename,
+    )
+
+    return {
+        "draft_id": draft_id,
+        "title": title,
+        "dossier_filename": state.dossier_filename,
+        "summary": (
+            f"Published draft {draft_id} for {state.dossier_filename!r}: "
+            f"title={title!r}. Token consumed; restart from begin if "
+            f"you need to write another draft."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -995,9 +1277,10 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 18 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 20 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
         "validate_against_voice, score_editorial_quality, "
+        "compose_stays_draft_begin, compose_stays_draft_publish, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms, "
