@@ -353,29 +353,41 @@ parsed dict in your own context.
    - `source_text` — pass to validate_against_voice and
      score_editorial_quality.
    - `parsed_description` — the parser's raw description. Your
-     starting point for rewriting.
+     starting point for rewriting the description field.
+   - `parsed_persona` — the parser's raw persona, auto-extracted from
+     the source body. Your starting point for rewriting the persona
+     field. The parser-generated persona almost always violates voice
+     rules; you MUST rewrite it.
    - `body_excerpt` — cruft-stripped body, your source of truth
      for facts.
    - `parsed_data_summary` — confirms what fields the draft will
      contain.
 
-2. Rewrite the description following §1-§8 rules. Use `body_excerpt`
-   and the frontmatter summary as your only source material. Do not
-   invent facts not present in those.
+2. Rewrite BOTH the description AND the persona following §1-§8 rules.
+   Use `body_excerpt` and the frontmatter values shown in
+   `parsed_data_summary` as your only source material. Do not invent
+   facts. Both fields are voice-validated at publish; the backstop
+   will block the write if either fails.
 
-3. Call `mcp_betty_validate_against_voice(site, text=YOUR_REWRITE,
-   source_text=THE_SOURCE_TEXT_FROM_STEP_1)`. If not compliant, fix
-   each violation and re-call. Cap at 3 iterations.
+   Persona target shape: one concise sentence — what the property is
+   in editorial framing. Example: "A three-bedroom heritage manse in
+   Bloomfield, walking distance to the bakery." NOT marketing pitch;
+   NOT atmospheric. Source-grounded property summary.
 
-4. Call `mcp_betty_score_editorial_quality(site, text=YOUR_REWRITE,
+3. Call `mcp_betty_validate_against_voice(site, text=YOUR_DESCRIPTION,
+   source_text=THE_SOURCE_TEXT_FROM_STEP_1)`. Then call it again with
+   `text=YOUR_PERSONA`. If either is non-compliant, fix each violation
+   and re-call. Cap at 3 iterations per field.
+
+4. Call `mcp_betty_score_editorial_quality(site, text=YOUR_DESCRIPTION,
    source_text=THE_SOURCE_TEXT_FROM_STEP_1)`. If `score >= 8` with
    empty violations, proceed to step 5. If score is 5-7 or violations
-   is non-empty, fix the patterns and restart from step 3. Cap at 3
-   full iterations.
+   is non-empty, fix the patterns and restart from step 3 for that
+   field. Cap at 3 full iterations.
 
 5. Call `mcp_betty_compose_stays_draft_publish(token=THE_TOKEN_FROM_STEP_1,
-   description=YOUR_FINAL_REWRITE)`. The response gives you the new
-   draft's ID and title.
+   description=YOUR_FINAL_DESCRIPTION, persona=YOUR_FINAL_PERSONA)`.
+   The response gives you the new draft's ID and title.
 
 ### What this changes vs. calling tools directly
 

@@ -748,17 +748,22 @@ def _enforce_voice_validation(
             })
     if all_violations:
         # Surface as a structured ValueError that FastMCP wraps as a
-        # tool error back to Betty. Each violation lists field, rule,
-        # match, and explanation so she can self-correct without
-        # re-running the validator.
-        first = all_violations[0]
-        summary = (
-            f"Voice validation blocked the write: {len(all_violations)} "
-            f"violation(s) across {len({v['field'] for v in all_violations})} "
-            f"field(s). First: {first['field']}.{first['rule']}="
-            f"{first['match']!r} — {first['explanation']}"
+        # tool error back to Betty. The message lists EVERY violation
+        # with its field name, rule, and offending substring up-front
+        # so the failure mode is unambiguous even when Hermes truncates
+        # long tool errors. Field name appears in the FIRST 100 chars
+        # so it survives truncation.
+        fields = sorted({v["field"] for v in all_violations})
+        head = (
+            f"VOICE VALIDATION BLOCKED WRITE on fields: {fields}. "
+            f"{len(all_violations)} violation(s) total."
         )
-        raise ValueError(summary)
+        per_violation_lines = [
+            f"  field={v['field']} rule={v['rule']} "
+            f"match={v['match']!r} — {v['explanation']}"
+            for v in all_violations
+        ]
+        raise ValueError(head + "\n" + "\n".join(per_violation_lines))
 
 
 # ---------------------------------------------------------------------------
@@ -1117,49 +1122,64 @@ def compose_stays_draft_begin(site: str, dossier_path: str) -> dict[str, Any]:
         "token": token,
         "source_text": source_text,
         "parsed_description": parsed_data.get("description", ""),
+        "parsed_persona": parsed_data.get("persona", ""),
         "body_excerpt": body_excerpt,
         "parsed_data_summary": parsed_data_summary,
         "frontmatter_keys": sorted(frontmatter.keys()),
         "dossier_filename": dossier_filename,
         "instructions": (
             f"Token {token} holds the parsed dossier for {dossier_filename}. "
-            f"Rewrite the description following the voice rules. Use "
-            f"mcp_betty_validate_against_voice and mcp_betty_score_editorial_quality "
-            f"to iterate. When score >= 8 with empty violations, call "
-            f"mcp_betty_compose_stays_draft_publish(token, description). "
-            f"Token expires in 30 minutes."
+            f"You MUST rewrite BOTH parsed_description AND parsed_persona "
+            f"following the voice rules — both fields are voice-validated "
+            f"at publish. Use mcp_betty_validate_against_voice and "
+            f"mcp_betty_score_editorial_quality to iterate on each. When "
+            f"both pass, call mcp_betty_compose_stays_draft_publish(token, "
+            f"description, persona). Token expires in 30 minutes."
         ),
     }
 
 
 @mcp.tool()
-def compose_stays_draft_publish(token: str, description: str) -> dict[str, Any]:
+def compose_stays_draft_publish(
+    token: str,
+    description: str,
+    persona: str,
+) -> dict[str, Any]:
     """Atomic step 2 of the Airbnb dossier → Stays draft workflow.
 
     Recovers the cached parsed_data using `token`, replaces the
-    description field with Betty's rewritten version, and writes the
-    Stays draft to EmDash. Mechanical voice validation runs as a
-    structural backstop — non-compliant drafts cannot reach EmDash
-    even if Betty skipped explicit validation.
+    description AND persona fields with Betty's rewritten versions, and
+    writes the Stays draft to EmDash. Mechanical voice validation runs
+    as a structural backstop on BOTH fields — non-compliant drafts
+    cannot reach EmDash even if Betty skipped explicit validation.
+
+    The Stays schema's voice-validated `check_fields` are description
+    and persona. The parser auto-extracts a persona from raw Airbnb
+    body text, which usually contains marketing voice. Betty must
+    rewrite both fields before publishing or the backstop will block.
 
     Args:
         token: The token returned by compose_stays_draft_begin. Treat
-            as opaque. Expired tokens return a clear error; restart
-            from begin.
-        description: Betty's final rewritten description. This replaces
-            the parser's raw description in the data dict before write.
+            as opaque. Expired or already-consumed tokens return a
+            clear error; restart from begin.
+        description: Betty's final rewritten description, voice-compliant.
+            Replaces the parser's raw description.
+        persona: Betty's final rewritten persona — a short one-sentence
+            framing of the property. Replaces the parser's raw persona.
+            Both fields must be voice-compliant; the backstop blocks
+            the write if either fails.
 
     Returns:
         Dict with:
           - draft_id: EmDash item ID of the new draft.
           - title: title field on the draft.
           - dossier_filename: which dossier the draft came from.
-          - cost_summary: brief note on workflow cost.
           - summary: human-readable confirmation.
     """
     logger.info(
-        "compose_stays_draft_publish called with token=%r, description len=%d",
-        token, len(description),
+        "compose_stays_draft_publish called with token=%r, "
+        "description len=%d, persona len=%d",
+        token, len(description), len(persona),
     )
     _prune_compose_state()
 
@@ -1176,18 +1196,25 @@ def compose_stays_draft_publish(token: str, description: str) -> dict[str, Any]:
             "compose_stays_draft_publish.description must be a non-empty "
             "string."
         )
+    if not isinstance(persona, str) or not persona.strip():
+        raise ValueError(
+            "compose_stays_draft_publish.persona must be a non-empty "
+            "string. The parser's auto-extracted persona usually has "
+            "marketing voice; rewrite it before publish."
+        )
 
     config, collection_schema = _collection_schema_for(state.site, "stays")
 
-    # Merge Betty's rewrite into the parsed data. We make a fresh dict
+    # Merge Betty's rewrites into the parsed data. We make a fresh dict
     # so the cache entry stays clean for any retries.
     final_data = dict(state.parsed_data)
     final_data["description"] = description
+    final_data["persona"] = persona
 
-    # Backstop: mechanical voice validation. If Betty skipped the
-    # explicit validate call, this catches non-compliant drafts before
-    # they hit EmDash. Source_text is the cached one — same string
-    # Betty validated against.
+    # Backstop: mechanical voice validation on every check_field. If
+    # Betty skipped the explicit validate call OR validated only one
+    # field, this catches non-compliant drafts before they hit EmDash.
+    # Source_text is the cached one — same string Betty validated against.
     _enforce_voice_validation(
         config, "stays", final_data, source_text=state.source_text,
     )
