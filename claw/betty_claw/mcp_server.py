@@ -1105,6 +1105,130 @@ def list_pending_airbnb_dossiers(site: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Kanban worker prompt generation (Phase 2.0 Step 2a)
+# ---------------------------------------------------------------------------
+# Each Kanban task that dispatches Betty to process one pending dossier
+# carries a fully-specified worker prompt as its task description. The
+# prompt is tight enough that a fresh Hermes sub-conversation (with no
+# accumulated context) can execute the full composed workflow without
+# wandering into discovery, batch-pattern-matching, or scope creep.
+#
+# Tunable here so the template can iterate as we observe Qwen's edge
+# cases. The {dossier_path} placeholder gets substituted per task.
+
+_WORKER_PROMPT_TEMPLATE = """\
+SINGLE-DOSSIER TASK — execute exactly this workflow, nothing more.
+
+1. Call mcp_betty_compose_stays_draft_begin with:
+     site="travelpec"
+     dossier_path="{dossier_path}"
+   Use the path verbatim. Do not call mcp_betty_list_pending_airbnb_dossiers \
+or any discovery tool. Do not list directories. Do not search for files. \
+The path is correct as given.
+
+2. From the response, capture: token, source_text, parsed_description, \
+parsed_persona, body_excerpt, parsed_data_summary. The token is the only \
+state you need to remember.
+
+3. Rewrite parsed_description following the voice rules in §1-§9 of \
+~/.hermes/memories/MEMORY.md and the voice doc at \
+/Users/betty/My Drive/Betty/emdash-sites/travelpec.com-v3/02-voice/\
+03-voice-calibration.md (already loaded). Use only facts present in \
+body_excerpt or the frontmatter values shown in parsed_data_summary. \
+Do not infer distances, capacities, ratings, or business names not in source. \
+Omit, don't invent.
+
+4. Rewrite parsed_persona — one concise editorial sentence describing the \
+property. Source-grounded only.
+
+5. Validate description: call mcp_betty_validate_against_voice with \
+site="travelpec", text=YOUR_DESCRIPTION, source_text=SOURCE_TEXT_FROM_STEP_2. \
+If violations, fix and re-call. Cap at 3 iterations.
+
+6. Validate persona the same way. Cap at 3 iterations.
+
+7. (Optional) Call mcp_betty_score_editorial_quality on description with \
+the same source_text. If score < 8 with violations, revise description and \
+re-validate from step 5.
+
+8. Call mcp_betty_compose_stays_draft_publish with:
+     token=TOKEN_FROM_STEP_2
+     description=YOUR_FINAL_DESCRIPTION
+     persona=YOUR_FINAL_PERSONA
+
+9. Report ONLY: draft_id, dossier filename, the final description, the \
+final persona. Stop. Do not call any more tools. Do not clean up older \
+drafts. Do not start another dossier. Do not query the worklist. \
+Your task is complete after the publish response."""
+
+
+@mcp.tool()
+def generate_pending_worker_prompts(site: str) -> dict[str, Any]:
+    """Generate one Kanban-ready worker prompt per pending Airbnb dossier.
+
+    For each dossier in the site's pending list (from
+    list_pending_airbnb_dossiers), produces a fully-specified worker
+    prompt that a fresh Hermes sub-conversation can execute end-to-end:
+    parse → rewrite both description and persona → validate both →
+    optionally score → publish → stop.
+
+    Each prompt has the exact dossier_path baked in (eliminating the
+    path-discovery failure mode we observed in chat sessions), explicit
+    "do not call discovery tools" directives, and an explicit
+    stop-after-publish instruction.
+
+    The output is intended to be fed into Hermes Kanban as task
+    descriptions — one Kanban task per pending dossier — so the queue
+    can run autonomously to completion with context reset between
+    dossiers. This sidesteps the chat-layer composition failure modes
+    we hit during ad-hoc prompting.
+
+    Args:
+        site: site_id slug. Currently must be "travelpec" — worker
+            template references travelpec-specific paths (voice doc
+            location, etc.).
+
+    Returns:
+        Dict with:
+          - count: number of worker prompts generated.
+          - worker_prompts: list of {dossier_filename, dossier_path,
+            worker_prompt}. Each `worker_prompt` is the full task
+            description ready to drop into a Kanban task.
+          - skipped: list of dossiers we couldn't extract a URL from
+            (passed through from list_pending_airbnb_dossiers).
+          - already_published_count: dossiers already in EmDash.
+    """
+    logger.info("generate_pending_worker_prompts called with site=%r", site)
+    pending_result = list_pending_airbnb_dossiers(site)
+    pending = pending_result["pending"]
+    skipped = pending_result["skipped"]
+    already_published_count = pending_result["counts"]["published"]
+
+    worker_prompts: list[dict[str, str]] = []
+    for entry in pending:
+        prompt = _WORKER_PROMPT_TEMPLATE.format(
+            dossier_path=entry["dossier_path"],
+        )
+        worker_prompts.append({
+            "dossier_filename": entry["dossier_filename"],
+            "dossier_path": entry["dossier_path"],
+            "worker_prompt": prompt,
+        })
+
+    logger.info(
+        "generate_pending_worker_prompts produced %d prompts (skipped %d, "
+        "already published %d)",
+        len(worker_prompts), len(skipped), already_published_count,
+    )
+    return {
+        "count": len(worker_prompts),
+        "worker_prompts": worker_prompts,
+        "skipped": skipped,
+        "already_published_count": already_published_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Composed workflow: Airbnb dossier → Stays draft (Phase 1.9)
 # ---------------------------------------------------------------------------
 # Two-call atomic workflow. begin parses + caches state server-side and
@@ -1454,10 +1578,10 @@ def main() -> None:
         "Pattern B multi-site)"
     )
     logger.info(
-        "Exposing 21 tools: list_sites, betty_ping, parse_airbnb_dossier, "
+        "Exposing 22 tools: list_sites, betty_ping, parse_airbnb_dossier, "
         "read_file, list_directory, git_status, git_diff, "
         "validate_against_voice, score_editorial_quality, "
-        "list_pending_airbnb_dossiers, "
+        "list_pending_airbnb_dossiers, generate_pending_worker_prompts, "
         "compose_stays_draft_begin, compose_stays_draft_publish, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
