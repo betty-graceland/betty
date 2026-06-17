@@ -1119,16 +1119,22 @@ def list_pending_airbnb_dossiers(site: str) -> dict[str, Any]:
 _WORKER_PROMPT_TEMPLATE = """\
 SINGLE-DOSSIER TASK — execute exactly this workflow, nothing more.
 
-1. Call mcp_betty_compose_stays_draft_begin with:
+The dossier_path for this task is:
+  {dossier_path}
+
+You will reference this same path twice: once in step 1, once in step 8. \
+There is no token to remember — just keep this path string in mind.
+
+1. Call mcp_betty_compose_stays_draft_preview with:
      site="travelpec"
      dossier_path="{dossier_path}"
    Use the path verbatim. Do not call mcp_betty_list_pending_airbnb_dossiers \
 or any discovery tool. Do not list directories. Do not search for files. \
 The path is correct as given.
 
-2. From the response, capture: token, source_text, parsed_description, \
-parsed_persona, body_excerpt, parsed_data_summary. The token is the only \
-state you need to remember.
+2. From the response, capture: source_text, parsed_description, \
+parsed_persona, body_excerpt, parsed_data_summary. No token; the path \
+above is your only state.
 
 3. Rewrite parsed_description following the voice rules in §1-§9 of \
 ~/.hermes/memories/MEMORY.md and the voice doc at \
@@ -1152,9 +1158,12 @@ the same source_text. If score < 8 with violations, revise description and \
 re-validate from step 5.
 
 8. Call mcp_betty_compose_stays_draft_publish with:
-     token=TOKEN_FROM_STEP_2
+     site="travelpec"
+     dossier_path="{dossier_path}"
      description=YOUR_FINAL_DESCRIPTION
      persona=YOUR_FINAL_PERSONA
+   Use the EXACT same dossier_path string from step 1. Do not modify it. \
+Do not abbreviate it. Do not paraphrase it.
 
 9. Report ONLY: draft_id, dossier filename, the final description, the \
 final persona. Stop. Do not call any more tools. Do not clean up older \
@@ -1229,27 +1238,28 @@ def generate_pending_worker_prompts(site: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Composed workflow: Airbnb dossier → Stays draft (Phase 1.9)
+# Composed workflow: Airbnb dossier → Stays draft (Phase 2.0 — tokenless)
 # ---------------------------------------------------------------------------
-# Two-call atomic workflow. begin parses + caches state server-side and
-# returns a token; publish accepts the token + Betty's rewritten
-# description and writes the draft.
+# Two-call workflow keyed by dossier_path. preview parses and returns
+# the materials Betty needs to rewrite; publish accepts the same
+# dossier_path plus Betty's rewrites and writes the draft.
 #
-# Why this exists: Qwen3.5-35B under Hermes loses track of parsed dossier
-# state when its context fills with validate/score iteration turns. Moving
-# the heavy state (full parsed_data dict, source_text, fixed_fields) into
-# the MCP server and giving Betty a token reduces her cognitive load to
-# "remember this short string." Validate and score remain stateless tools
-# Betty calls between begin and publish; her iteration loop is unchanged
-# in shape, just lighter on context.
+# Why no token: Qwen3.5-35B cannot reliably copy state-carrying strings
+# between tool calls. Earlier token-based design saw ~30% failure rate
+# from Betty inventing a different token string at publish time than
+# was returned by begin. dossier_path is in Betty's original prompt
+# (not a tool response), so she copies it from instructions rather than
+# from short-term memory. The server-side cache is keyed by
+# (site, dossier_path) for performance; on cache miss publish re-parses
+# the dossier itself, so correctness no longer depends on cache hit.
 
 @dataclass(frozen=True)
 class _ComposeState:
-    """One in-flight Stays compose session.
+    """One parsed-dossier state entry.
 
-    Stored in the server-side cache for up to _COMPOSE_STATE_TTL_SECONDS.
-    All fields needed to atomically publish without re-parsing the
-    dossier or re-loading site config.
+    Stored in the server-side cache for up to _COMPOSE_STATE_TTL_SECONDS
+    as a performance optimization. publish recovers the same state from
+    cache or by re-parsing; this is a perf concern, not a correctness one.
     """
     site: str
     dossier_filename: str
@@ -1260,80 +1270,42 @@ class _ComposeState:
     created_at: float
 
 
-_compose_state_cache: dict[str, _ComposeState] = {}
+# Keyed by (site, dossier_path) tuple so the cache lookup uses values
+# Betty already has in her prompt rather than a random UUID she has to
+# carry between tool calls.
+_compose_state_cache: dict[tuple[str, str], _ComposeState] = {}
 
-# TTL: long enough for an unhurried iteration loop with multiple
-# rewrite passes; short enough that abandoned sessions get reaped.
+# TTL bounds stale cache entries. publish on cache miss re-parses, so
+# expiry isn't a correctness issue — just controls memory growth on
+# long-running MCP servers.
 _COMPOSE_STATE_TTL_SECONDS = 30 * 60
 
 
 def _prune_compose_state() -> None:
-    """Drop expired entries. Called at the start of begin/publish.
+    """Drop expired entries. Called at the start of preview/publish.
 
-    Cheap O(n) scan since the cache rarely holds more than a handful
-    of in-flight sessions. If it ever grows, switch to a heap-keyed
-    expiry queue.
+    Cheap O(n) scan; the cache rarely holds more than a handful of
+    entries since publish evicts on success and ttl reaps abandoned
+    previews.
     """
     now = time.time()
     expired = [
-        token for token, state in _compose_state_cache.items()
+        key for key, state in _compose_state_cache.items()
         if now - state.created_at > _COMPOSE_STATE_TTL_SECONDS
     ]
-    for token in expired:
-        del _compose_state_cache[token]
+    for key in expired:
+        del _compose_state_cache[key]
     if expired:
         logger.info("Pruned %d expired compose state(s)", len(expired))
 
 
-@mcp.tool()
-def compose_stays_draft_begin(site: str, dossier_path: str) -> dict[str, Any]:
-    """Atomic step 1 of the Airbnb dossier → Stays draft workflow.
+def _parse_dossier_state(site: str, dossier_path: str) -> _ComposeState:
+    """Parse a dossier and build the compose state.
 
-    Parses the dossier under the site's read-allowed roots, computes the
-    source_text Betty needs for validate_against_voice and
-    score_editorial_quality, caches the full parsed state server-side,
-    and returns a short token + the materials Betty needs to compose
-    her rewrite.
-
-    After this call, Betty's only state to remember is the `token`
-    string. She can iterate rewrites with mcp_betty_validate_against_voice
-    and mcp_betty_score_editorial_quality as long as she likes — those
-    tools are stateless. When her rewrite is ready, she calls
-    compose_stays_draft_publish with the token + final description.
-
-    Token TTL is 30 minutes. After that the cache evicts the entry and
-    publish will return a clear "expired" error; Betty must restart
-    from begin.
-
-    Args:
-        site: site_id slug. Currently must be "travelpec" — the workflow
-            is parser-specific and only travelpec has a configured
-            airbnb_dossier parser in Phase 1.9.
-        dossier_path: Absolute or ~-prefixed path to the dossier .md file.
-            Must resolve under one of the site's read roots.
-
-    Returns:
-        Dict with:
-          - token: opaque UUID4 to pass to publish. Treat as opaque.
-          - source_text: precomputed string for validate/score calls.
-          - parsed_description: the parser's raw description field.
-            Use this as your starting point for editorial rewrite.
-          - body_excerpt: the parser's cruft-stripped body. Use to
-            verify facts when rewriting.
-          - parsed_data_summary: short human-readable summary of every
-            field the parser extracted, so you can confirm what the
-            draft will contain.
-          - frontmatter_keys: list of keys present in the source
-            frontmatter — useful for the number-grounding check
-            (numbers in those values are valid in your rewrite).
-          - instructions: short next-steps reminder.
+    Used by both preview (which caches the result) and publish (which
+    falls back to this on cache miss). Centralizing here means the two
+    tools cannot drift in how they interpret the dossier.
     """
-    logger.info(
-        "compose_stays_draft_begin called with site=%r, dossier_path=%r",
-        site, dossier_path,
-    )
-    _prune_compose_state()
-
     config = load_site_config(site)
     parser_cfg = config.parser("airbnb_dossier")
     if not parser_cfg.target_collection:
@@ -1360,32 +1332,80 @@ def compose_stays_draft_begin(site: str, dossier_path: str) -> dict[str, Any]:
     body_excerpt: str = str(payload.get("body_excerpt") or "")
     source_text = f"{frontmatter}\n{body_excerpt}"
 
-    # Generate a short token. UUID4 hex is 32 chars — terser than the
-    # full UUID and Hermes handles it cleanly in chat.
-    token = uuid.uuid4().hex
-
-    from pathlib import Path as _Path
-    dossier_filename = _Path(dossier_path).name
-
-    _compose_state_cache[token] = _ComposeState(
+    return _ComposeState(
         site=site,
-        dossier_filename=dossier_filename,
+        dossier_filename=Path(dossier_path).name,
         parsed_data=parsed_data,
         source_text=source_text,
         body_excerpt=body_excerpt,
         frontmatter=frontmatter,
         created_at=time.time(),
     )
-    logger.info(
-        "compose_stays_draft_begin issued token %s for site=%r dossier=%r",
-        token, site, dossier_filename,
-    )
 
-    # Human-readable summary of every field the parser produced. Lets
-    # Betty confirm what the draft will contain without re-reading the
-    # full parsed_data dict.
+
+def _get_or_parse_compose_state(site: str, dossier_path: str) -> _ComposeState:
+    """Return cached compose state or parse fresh on miss.
+
+    Cache key is the (site, dossier_path) tuple — values Betty already
+    has in her prompt. No token. On cache miss the dossier is re-parsed
+    and the result cached; this happens transparently to Betty.
+    """
+    _prune_compose_state()
+    key = (site, dossier_path)
+    state = _compose_state_cache.get(key)
+    if state is not None:
+        return state
+    state = _parse_dossier_state(site, dossier_path)
+    _compose_state_cache[key] = state
+    return state
+
+
+@mcp.tool()
+def compose_stays_draft_preview(site: str, dossier_path: str) -> dict[str, Any]:
+    """Parse an Airbnb dossier and return the materials needed to compose
+    a Stays draft rewrite.
+
+    Tokenless workflow (Phase 2.0): this call no longer issues a session
+    token. The dossier_path you pass here is the same string you pass
+    to compose_stays_draft_publish — no intermediate state to carry.
+    Server caches the parse for performance but publish re-parses on
+    cache miss, so correctness doesn't depend on cache hit.
+
+    After this call, rewrite parsed_description and parsed_persona
+    following the voice rules. Use mcp_betty_validate_against_voice
+    and mcp_betty_score_editorial_quality to iterate. When both pass,
+    call mcp_betty_compose_stays_draft_publish with the same site and
+    dossier_path plus your final rewrites.
+
+    Args:
+        site: site_id slug (e.g., "travelpec").
+        dossier_path: Absolute path to the dossier .md file. Must
+            resolve under one of the site's read roots.
+
+    Returns:
+        Dict with:
+          - source_text: precomputed string for validate/score calls.
+          - parsed_description: the parser's raw description. Your
+            starting point for editorial rewrite.
+          - parsed_persona: the parser's raw persona, extracted from
+            Airbnb body text. Almost always marketing voice; you MUST
+            rewrite it before publish.
+          - body_excerpt: cruft-stripped body, your source of truth.
+          - parsed_data_summary: human-readable field summary.
+          - frontmatter_keys: list of frontmatter keys (their values
+            are valid sources for numbers in your rewrite).
+          - dossier_filename: short filename for your report.
+          - instructions: next-steps reminder.
+    """
+    logger.info(
+        "compose_stays_draft_preview called with site=%r, dossier_path=%r",
+        site, dossier_path,
+    )
+    state = _get_or_parse_compose_state(site, dossier_path)
+
+    # Human-readable summary of every field the parser produced.
     summary_lines = []
-    for k, v in parsed_data.items():
+    for k, v in state.parsed_data.items():
         v_str = str(v)
         if len(v_str) > 80:
             v_str = v_str[:77] + "..."
@@ -1393,39 +1413,40 @@ def compose_stays_draft_begin(site: str, dossier_path: str) -> dict[str, Any]:
     parsed_data_summary = "\n".join(summary_lines)
 
     return {
-        "token": token,
-        "source_text": source_text,
-        "parsed_description": parsed_data.get("description", ""),
-        "parsed_persona": parsed_data.get("persona", ""),
-        "body_excerpt": body_excerpt,
+        "source_text": state.source_text,
+        "parsed_description": state.parsed_data.get("description", ""),
+        "parsed_persona": state.parsed_data.get("persona", ""),
+        "body_excerpt": state.body_excerpt,
         "parsed_data_summary": parsed_data_summary,
-        "frontmatter_keys": sorted(frontmatter.keys()),
-        "dossier_filename": dossier_filename,
+        "frontmatter_keys": sorted(state.frontmatter.keys()),
+        "dossier_filename": state.dossier_filename,
         "instructions": (
-            f"Token {token} holds the parsed dossier for {dossier_filename}. "
-            f"You MUST rewrite BOTH parsed_description AND parsed_persona "
-            f"following the voice rules — both fields are voice-validated "
-            f"at publish. Use mcp_betty_validate_against_voice and "
-            f"mcp_betty_score_editorial_quality to iterate on each. When "
-            f"both pass, call mcp_betty_compose_stays_draft_publish(token, "
-            f"description, persona). Token expires in 30 minutes."
+            f"Dossier {state.dossier_filename} parsed. You MUST rewrite "
+            f"BOTH parsed_description AND parsed_persona following the "
+            f"voice rules — both are voice-validated at publish. When "
+            f"both rewrites pass validation and score, call "
+            f"mcp_betty_compose_stays_draft_publish with the SAME site "
+            f"and dossier_path you passed here, plus your two rewrites. "
+            f"There is no token to remember — just keep the dossier_path."
         ),
     }
 
 
 @mcp.tool()
 def compose_stays_draft_publish(
-    token: str,
+    site: str,
+    dossier_path: str,
     description: str,
     persona: str,
 ) -> dict[str, Any]:
-    """Atomic step 2 of the Airbnb dossier → Stays draft workflow.
+    """Publish a Stays draft for the named dossier with Betty's rewrites.
 
-    Recovers the cached parsed_data using `token`, replaces the
-    description AND persona fields with Betty's rewritten versions, and
-    writes the Stays draft to EmDash. Mechanical voice validation runs
-    as a structural backstop on BOTH fields — non-compliant drafts
-    cannot reach EmDash even if Betty skipped explicit validation.
+    Tokenless workflow (Phase 2.0): looks up the cached parse for
+    (site, dossier_path), or re-parses the dossier if the cache has
+    expired. Replaces description and persona with Betty's rewrites
+    and writes the Stays draft to EmDash. Mechanical voice validation
+    runs as a structural backstop on BOTH fields — non-compliant
+    drafts cannot reach EmDash even if Betty skipped explicit validation.
 
     The Stays schema's voice-validated `check_fields` are description
     and persona. The parser auto-extracts a persona from raw Airbnb
@@ -1433,37 +1454,18 @@ def compose_stays_draft_publish(
     rewrite both fields before publishing or the backstop will block.
 
     Args:
-        token: The token returned by compose_stays_draft_begin. Treat
-            as opaque. Expired or already-consumed tokens return a
-            clear error; restart from begin.
+        site: site_id slug. Must match the site used in preview.
+        dossier_path: Same dossier_path passed to preview. The server
+            uses this to look up cached parse state, or to re-parse
+            on cache miss.
         description: Betty's final rewritten description, voice-compliant.
-            Replaces the parser's raw description.
-        persona: Betty's final rewritten persona — a short one-sentence
-            framing of the property. Replaces the parser's raw persona.
-            Both fields must be voice-compliant; the backstop blocks
-            the write if either fails.
-
-    Returns:
-        Dict with:
-          - draft_id: EmDash item ID of the new draft.
-          - title: title field on the draft.
-          - dossier_filename: which dossier the draft came from.
-          - summary: human-readable confirmation.
+        persona: Betty's final rewritten persona — one editorial sentence.
     """
     logger.info(
-        "compose_stays_draft_publish called with token=%r, "
+        "compose_stays_draft_publish called with site=%r, dossier_path=%r, "
         "description len=%d, persona len=%d",
-        token, len(description), len(persona),
+        site, dossier_path, len(description), len(persona),
     )
-    _prune_compose_state()
-
-    state = _compose_state_cache.get(token)
-    if state is None:
-        raise ValueError(
-            f"Token {token!r} not found in compose state cache. "
-            f"Either it expired (30-min TTL) or it was never issued. "
-            f"Restart from compose_stays_draft_begin."
-        )
 
     if not isinstance(description, str) or not description.strip():
         raise ValueError(
@@ -1477,18 +1479,19 @@ def compose_stays_draft_publish(
             "marketing voice; rewrite it before publish."
         )
 
+    # Cache hit or re-parse on miss. Either way Betty doesn't see the
+    # difference — the path she has in her prompt is all that's needed.
+    state = _get_or_parse_compose_state(site, dossier_path)
+
     config, collection_schema = _collection_schema_for(state.site, "stays")
 
-    # Merge Betty's rewrites into the parsed data. We make a fresh dict
-    # so the cache entry stays clean for any retries.
+    # Merge Betty's rewrites into the parsed data. Fresh dict so the
+    # cache entry stays clean.
     final_data = dict(state.parsed_data)
     final_data["description"] = description
     final_data["persona"] = persona
 
-    # Backstop: mechanical voice validation on every check_field. If
-    # Betty skipped the explicit validate call OR validated only one
-    # field, this catches non-compliant drafts before they hit EmDash.
-    # Source_text is the cached one — same string Betty validated against.
+    # Backstop: mechanical voice validation on every check_field.
     _enforce_voice_validation(
         config, "stays", final_data, source_text=state.source_text,
     )
@@ -1507,11 +1510,11 @@ def compose_stays_draft_publish(
     ) or "(unknown)"
     title = final_data.get("title", "(no title)")
 
-    # Evict the token after successful publish — single-use semantics
-    # so Betty can't accidentally publish the same dossier twice with
-    # the same token. (She can begin again on the same dossier if she
-    # really wants a second draft.)
-    _compose_state_cache.pop(token, None)
+    # Evict on successful publish so the same dossier doesn't accidentally
+    # double-publish from a stale cache entry. (Betty can preview again
+    # to re-parse and re-cache if she wants to write another draft for
+    # the same dossier.)
+    _compose_state_cache.pop((site, dossier_path), None)
     logger.info(
         "compose_stays_draft_publish wrote draft_id=%s for dossier=%r",
         draft_id, state.dossier_filename,
@@ -1523,8 +1526,8 @@ def compose_stays_draft_publish(
         "dossier_filename": state.dossier_filename,
         "summary": (
             f"Published draft {draft_id} for {state.dossier_filename!r}: "
-            f"title={title!r}. Token consumed; restart from begin if "
-            f"you need to write another draft."
+            f"title={title!r}. Cache entry consumed; preview again if "
+            f"you need to write another draft for this dossier."
         ),
     }
 
@@ -1582,7 +1585,7 @@ def main() -> None:
         "read_file, list_directory, git_status, git_diff, "
         "validate_against_voice, score_editorial_quality, "
         "list_pending_airbnb_dossiers, generate_pending_worker_prompts, "
-        "compose_stays_draft_begin, compose_stays_draft_publish, "
+        "compose_stays_draft_preview, compose_stays_draft_publish, "
         "emdash_list_collections, emdash_get_collection_schema, "
         "emdash_list_content, emdash_get_content, "
         "emdash_list_taxonomies, emdash_list_taxonomy_terms, "
