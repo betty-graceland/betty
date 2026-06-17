@@ -241,3 +241,140 @@ def compose_field(
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
     )
+
+
+# ---------------------------------------------------------------------------
+# Title composition (different prompt shape than description/persona)
+# ---------------------------------------------------------------------------
+
+_TITLE_SYSTEM_PROMPT_TEMPLATE = """\
+You are an editorial title-writer for {domain}, a curated directory of
+stays in Prince Edward County. You compose short editorial titles for
+each Stays page. The Airbnb listing's original title is usually SEO-
+stuffed ("Beautiful 7BR Country Farmhouse with Yoga Studio") and not
+suitable as an editorial headline.
+
+Your job: produce a short, editorial title (3-7 words) for the property
+described in the source body.
+
+TITLE RULES:
+
+1. If the source body clearly names the property — "The Suite Spot",
+   "The Parsonage", "The Blue Roof", "Chalet On The Bay", etc. — use
+   that name as the title. Property names are almost always introduced
+   with "The" or a similar definite article.
+
+2. If no clear property name appears in the source, invent a short
+   editorial title (3-7 words) based on the property's most distinctive
+   characteristic. Good shapes:
+     - "The [Village] Manse"       (village + building type)
+     - "The [Village] Farmhouse"   (village + building type)
+     - "A [Village] Cabin"
+     - "The [Era] Saltbox"         (architectural era + style)
+     - "The [Feature] House"       (signature amenity + simple noun)
+     - "The [Geographic Feature]"  (a named bay, road, or landmark)
+
+3. Forbidden patterns:
+     - SEO stuffing: "Beautiful 7BR Country Farmhouse with Yoga Studio"
+     - Marketing intensifiers: stunning, luxurious, incredible, perfect,
+       amazing, breathtaking, charming, quaint, vibrant, authentic,
+       cozy, dreamy, magical
+     - Generic placeholders: "Lovely Home", "Great Stay", "Nice Place"
+     - Capacity-in-title: "7-Bedroom Farmhouse", "Sleeps 14"
+
+4. Style: Title case. No punctuation at the end. No marketing copy.
+
+OUTPUT RULES:
+
+- Return ONLY the title text, plain string.
+- No preamble. No code fence. No quotes around the title.
+- No meta-commentary.
+"""
+
+
+_TITLE_USER_PROMPT_TEMPLATE = """\
+Compose an editorial title for this stay on {domain}.
+
+AIRBNB'S ORIGINAL TITLE (usually SEO-stuffed, not suitable as-is):
+
+{parsed_title}
+
+SOURCE BODY (your only allowed source for property name + facts):
+
+{body_excerpt}
+
+SOURCE FRONTMATTER (village, property type, license, etc.):
+
+{frontmatter_summary}
+
+Return only the editorial title. 3-7 words. Title case. No punctuation.
+"""
+
+
+def compose_title(
+    *,
+    parsed_title: str,
+    body_excerpt: str,
+    frontmatter: dict[str, Any],
+    domain: str,
+    model: str | None = None,
+    timeout_s: float = 30.0,
+) -> ComposeResult:
+    """Compose an editorial title for one Stays page.
+
+    Distinct from compose_field because title generation has a different
+    shape: it's not a rewrite of marketing-voice prose, it's either
+    extraction of a real property name from the source or fabrication
+    of a short editorial headline from the property's distinctive
+    features. Voice-validation rules don't apply (titles are too short
+    for mechanical checks to be meaningful); we rely on Claude following
+    the title-specific prompt above.
+
+    Args:
+        parsed_title: The Airbnb listing's original title — usually SEO-
+            stuffed. Passed to Claude as context (so it knows what NOT
+            to produce) but Claude should not preserve it.
+        body_excerpt: Source body for facts and possible property names.
+        frontmatter: Frontmatter for village/property type context.
+        domain: Site domain for prompt personalization.
+
+    Returns:
+        ComposeResult with the editorial title.
+    """
+    resolved_model = (
+        model
+        or os.environ.get("ANTHROPIC_CONTENT_MODEL")
+        or DEFAULT_CONTENT_MODEL
+    )
+    client = AnthropicClient(
+        api_key=os.environ.get("ANTHROPIC_API_KEY"),
+        model=resolved_model,
+        timeout_s=timeout_s,
+    )
+
+    system_prompt = _TITLE_SYSTEM_PROMPT_TEMPLATE.format(domain=domain)
+    user_prompt = _TITLE_USER_PROMPT_TEMPLATE.format(
+        domain=domain,
+        parsed_title=parsed_title or "(empty)",
+        body_excerpt=body_excerpt or "(empty)",
+        frontmatter_summary=_format_frontmatter_summary(frontmatter),
+    )
+
+    response = client.send(
+        prompt=user_prompt,
+        system=system_prompt,
+        max_tokens=128,
+    )
+
+    # Title-specific cleanup: strip trailing punctuation and surrounding
+    # quotes that Claude sometimes adds despite instructions.
+    text = response.content.strip()
+    text = text.strip('"').strip("'").rstrip(".!?,").strip()
+
+    return ComposeResult(
+        text=text,
+        model=response.model,
+        cost_usd=response.cost_usd,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )

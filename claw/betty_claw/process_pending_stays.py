@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from betty_claw.anthropic_client import AnthropicClientError
-from betty_claw.content_composer import ComposeResult, compose_field
+from betty_claw.content_composer import ComposeResult, compose_field, compose_title
 from betty_claw.emdash_client import EmdashClient
 from betty_claw.site_config import SiteConfig, load_site_config
 from betty_claw.tools.airbnb_parser import (
@@ -112,6 +112,7 @@ class DossierResult:
     failed: bool = False
     skipped: bool = False
     draft_id: str | None = None
+    final_title: str | None = None
     final_description: str | None = None
     final_persona: str | None = None
     editorial_score: int | None = None
@@ -477,10 +478,27 @@ def process_one_dossier(
         result.compose_calls += score_calls
         result.editorial_score = final_score
 
-        # 5. Assemble final data and publish (or dry-run report).
+        # 5. Compose editorial title. The parser's title is the Airbnb
+        # SEO heading ("Beautiful 7BR Country Farmhouse with Yoga
+        # Studio"); we replace it with either the source's actual
+        # property name or a fabricated short editorial title.
+        title_result = compose_title(
+            parsed_title=parsed_data.get("title", ""),
+            body_excerpt=body_excerpt,
+            frontmatter=frontmatter,
+            domain=config.domain,
+        )
+        result.cost_usd += title_result.cost_usd
+        result.compose_calls += 1
+        final_title = title_result.text
+        logger.info("  title: %r", final_title)
+
+        # 6. Assemble final data and publish (or dry-run report).
         final_data = dict(parsed_data)
+        final_data["title"] = final_title
         final_data["description"] = final_desc
         final_data["persona"] = persona_text
+        result.final_title = final_title
 
         if dry_run:
             logger.info("  DRY RUN: would publish to EmDash (skipped)")
@@ -504,12 +522,20 @@ def process_one_dossier(
             client=emdash,
             collection_schema=config.collections["stays"],
         )
+        # EmDash returns either {id, data:{...}} or {data:{id, ...}}
+        # depending on the underlying call shape; check both.
         response = publish_result.payload.get("data") or {}
-        draft_id = (
-            response.get("id")
-            if isinstance(response, dict)
-            else None
-        ) or "(unknown)"
+        draft_id: str = "(unknown)"
+        if isinstance(response, dict):
+            top_id = response.get("id")
+            if isinstance(top_id, str) and top_id:
+                draft_id = top_id
+            else:
+                nested = response.get("data")
+                if isinstance(nested, dict):
+                    nested_id = nested.get("id")
+                    if isinstance(nested_id, str) and nested_id:
+                        draft_id = nested_id
 
         result.draft_id = draft_id
         result.final_description = final_desc
@@ -620,6 +646,8 @@ def print_summary(batch: BatchResult) -> None:
                 f"  ✓ {r.dossier_filename:48s} "
                 f"draft_id={r.draft_id} score={r.editorial_score}/10"
             )
+            if r.final_title:
+                print(f"      title:  {r.final_title!r}")
     if batch.failed:
         print()
         print("Failures (require operator review):")
