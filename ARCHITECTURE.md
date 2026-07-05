@@ -1,3 +1,6 @@
+> **SUPERSEDED 2026-07-05** by betty-three-party-implementation-plan.md (Drive/Betty folder, FROZEN v1.2).
+> Substrate (Postgres/pgvector) and embedding-isolation decisions remain valid; the four-plane Qwen actor design does not.
+
 # Betty — Architecture
 
 ## Why Betty
