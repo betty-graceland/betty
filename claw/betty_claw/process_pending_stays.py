@@ -1,47 +1,40 @@
 """
 Deterministic Stays pipeline (Phase 3.0).
-
 A CLI script that lists every pending Airbnb dossier for a site,
 processes each end-to-end through parse → compose → validate → score
 → publish, and reports results. No agent loop. No tool reasoning. No
 Qwen, no Hermes, no MCP. Just Python calling Claude for the content
 composition step, with deterministic control flow for everything else.
-
 The agent runtime architecture (compose_stays_draft_preview/publish,
 worker prompts, SOUL.md directives) was the source of every reliability
 failure we observed during Phase 2.0 testing — string-copying between
 tool calls, scope-creep recovery cascades, single-task vs batch mode
 ambiguity. The pipeline underneath that agent layer was always sound,
 and this script is that pipeline directly.
-
 USAGE
 =====
-
     cd ~/code/betty
     uv run python -m betty_claw.process_pending_stays --site travelpec
     uv run python -m betty_claw.process_pending_stays --site travelpec --limit 3
     uv run python -m betty_claw.process_pending_stays --site travelpec --dry-run
     uv run python -m betty_claw.process_pending_stays --site travelpec --dossier-filename Foo.md
-
 Exit code is 0 if every pending dossier was either successfully
 published or cleanly skipped, 1 if any dossier failed in a way that
 warrants operator inspection.
-
 Cost: ~$0.02-0.10 per dossier on Haiku 4.5 (3-5 Anthropic calls per
 draft including retries). Set ANTHROPIC_CONTENT_MODEL=claude-sonnet-4-6
 to upgrade if voice quality on Haiku proves insufficient.
 """
-
 from __future__ import annotations
-
 import argparse
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
+from betty_claw import betty_handoff_report as hr
 from betty_claw.anthropic_client import AnthropicClientError
 from betty_claw.content_composer import ComposeResult, compose_field, compose_title
 from betty_claw.emdash_client import EmdashClient
@@ -59,12 +52,9 @@ from betty_claw.tools.voice_validation import (
     validate_text as _validate_text,
     violation_to_dict as _violation_to_dict,
 )
-
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
@@ -72,36 +62,27 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("betty.pipeline")
-
-
 # ---------------------------------------------------------------------------
 # Retry budgets
 # ---------------------------------------------------------------------------
-
 # How many times each field gets re-asked of Claude after a validation
 # failure. 2 means: initial attempt + up to 2 retries = 3 total tries
 # per field. If we still have violations after the third, the dossier
 # is marked failed for that field.
 _VOICE_VALIDATION_RETRIES = 2
-
 # How many times we re-ask for a low editorial score. Score-based
 # retries are cheaper because they only trigger when the mechanical
 # validator already passed.
 _EDITORIAL_SCORE_RETRIES = 1
-
 # Score threshold below which we ask Claude for another pass. 8/10 is
 # the doc's published "ready" bar.
 _EDITORIAL_SCORE_TARGET = 8
-
-
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
-
 @dataclass
 class DossierResult:
     """One dossier's end-state after processing.
-
     success=True means a draft was published. failed=True means the
     dossier reached a fatal error. skipped=True means it was filtered
     out (e.g., already published, or operator's --dossier-filename
@@ -115,13 +96,12 @@ class DossierResult:
     final_title: str | None = None
     final_description: str | None = None
     final_persona: str | None = None
+    source_text: str | None = None
     editorial_score: int | None = None
     cost_usd: float = 0.0
     compose_calls: int = 0
     error_summary: str | None = None
     duration_s: float = 0.0
-
-
 @dataclass
 class BatchResult:
     """Outcome of one run of the script."""
@@ -129,32 +109,22 @@ class BatchResult:
     total_cost_usd: float = 0.0
     total_compose_calls: int = 0
     duration_s: float = 0.0
-
     @property
     def succeeded(self) -> list[DossierResult]:
         return [r for r in self.results if r.success]
-
     @property
     def failed(self) -> list[DossierResult]:
         return [r for r in self.results if r.failed]
-
     @property
     def skipped(self) -> list[DossierResult]:
         return [r for r in self.results if r.skipped]
-
-
 # ---------------------------------------------------------------------------
 # Worklist helpers
 # ---------------------------------------------------------------------------
-
 import re as _re
-
 _DOSSIER_URL_PATTERN = _re.compile(r"^url:\s*(.+?)\s*$", _re.MULTILINE)
-
-
 def _extract_url_from_dossier(path: Path) -> str | None:
     """Read just the frontmatter to get the dossier's url field.
-
     Used to cross-reference against EmDash for already-published items.
     Mirrors the logic in mcp_server.list_pending_airbnb_dossiers so the
     two stay consistent.
@@ -173,14 +143,11 @@ def _extract_url_from_dossier(path: Path) -> str | None:
     if not m:
         return None
     return m.group(1).strip()
-
-
 def list_pending_dossiers(
     config: SiteConfig,
     emdash: EmdashClient,
 ) -> list[Path]:
     """Return paths to dossiers not yet published as Stays in EmDash.
-
     Walks the dossier directory, extracts each file's url, fetches the
     current Stays collection from EmDash, and returns dossiers whose
     url is not present. Same logic as the MCP worklist tool, but called
@@ -197,7 +164,6 @@ def list_pending_dossiers(
             f"Dossier directory not found: {dossier_dir}. "
             f"Check site.paths.research."
         )
-
     # Build set of URLs already in EmDash. Paginate as needed.
     published_urls: set[str] = set()
     cursor: str | None = None
@@ -223,7 +189,6 @@ def list_pending_dossiers(
         if not next_cursor:
             break
         cursor = next_cursor
-
     # Enumerate pending dossiers.
     pending: list[Path] = []
     for dossier_path in sorted(dossier_dir.glob("*.md")):
@@ -231,17 +196,13 @@ def list_pending_dossiers(
         if url and url not in published_urls:
             pending.append(dossier_path)
     return pending
-
-
 # ---------------------------------------------------------------------------
 # Per-dossier pipeline
 # ---------------------------------------------------------------------------
-
 def _parse_dossier(
     config: SiteConfig, dossier_path: Path,
 ) -> dict[str, Any]:
     """Parse one dossier into the data dict the rest of the pipeline uses.
-
     Wraps the underlying tools.airbnb_parser.parse_airbnb_dossier call
     with the site-config-derived allowed_roots, fixed_fields, and
     target collection schema. Returns the full payload dict.
@@ -255,8 +216,6 @@ def _parse_dossier(
         target_collection_schema=config.collections[target_collection],
     )
     return result.payload
-
-
 def _compose_with_validation(
     *,
     field_name: str,
@@ -269,7 +228,6 @@ def _compose_with_validation(
 ) -> tuple[str, float, int]:
     """Compose one field, validating after each attempt, retrying on
     violations.
-
     Returns (final_text, total_cost_usd, total_calls). Raises ValueError
     if all retries exhausted.
     """
@@ -278,7 +236,6 @@ def _compose_with_validation(
     previous_attempt: str | None = None
     violations: list[dict[str, Any]] | None = None
     voice_rules = config.voice_validation
-
     for attempt in range(_VOICE_VALIDATION_RETRIES + 1):
         compose_result: ComposeResult = compose_field(
             field_name=field_name,
@@ -293,12 +250,10 @@ def _compose_with_validation(
         total_cost += compose_result.cost_usd
         total_calls += 1
         candidate = compose_result.text
-
         # Validate against mechanical voice rules.
         if voice_rules is None or not voice_rules.enabled:
             # No validation configured — accept first compose.
             return candidate, total_cost, total_calls
-
         v_records = _validate_text(candidate, source_text, voice_rules)
         if not v_records:
             logger.info(
@@ -306,7 +261,6 @@ def _compose_with_validation(
                 field_name, attempt + 1, _VOICE_VALIDATION_RETRIES + 1,
             )
             return candidate, total_cost, total_calls
-
         violations = [_violation_to_dict(v) for v in v_records]
         previous_attempt = candidate
         logger.info(
@@ -314,14 +268,11 @@ def _compose_with_validation(
             field_name, attempt + 1, _VOICE_VALIDATION_RETRIES + 1,
             len(violations),
         )
-
     raise ValueError(
         f"{field_name}: exhausted {_VOICE_VALIDATION_RETRIES + 1} attempts "
         f"without passing voice validation. Final violations: "
         f"{[v['rule'] + ':' + v['match'] for v in (violations or [])]}"
     )
-
-
 def _score_with_retry(
     *,
     description: str,
@@ -333,7 +284,6 @@ def _score_with_retry(
     source_text: str,
 ) -> tuple[str, int, float, int]:
     """Score description editorially; retry once if score < target.
-
     Returns (final_description, final_score, total_cost_usd, total_calls).
     The description may be replaced if the retry produces a better one;
     if the retry score is worse, we keep the original.
@@ -342,7 +292,6 @@ def _score_with_retry(
     total_calls = 0
     current = description
     final_score = 0
-
     for attempt in range(_EDITORIAL_SCORE_RETRIES + 1):
         try:
             score = _score_editorial_quality(
@@ -355,7 +304,6 @@ def _score_with_retry(
                 "Skipping score-based retry.", e,
             )
             return current, 0, total_cost, total_calls
-
         total_cost += score.cost_usd
         final_score = score.score
         logger.info(
@@ -366,11 +314,9 @@ def _score_with_retry(
         )
         if score.score >= _EDITORIAL_SCORE_TARGET and not score.violations:
             return current, score.score, total_cost, total_calls
-
         if attempt >= _EDITORIAL_SCORE_RETRIES:
             # Out of retries; accept the current draft even if score is low.
             return current, score.score, total_cost, total_calls
-
         # Retry: feed the score violations to the composer as feedback.
         retry_violations = [
             {
@@ -408,10 +354,7 @@ def _score_with_retry(
                 # Don't adopt the retry; loop will exit on next iteration.
                 continue
         current = compose_result.text
-
     return current, final_score, total_cost, total_calls
-
-
 def process_one_dossier(
     *,
     config: SiteConfig,
@@ -433,11 +376,11 @@ def process_one_dossier(
         frontmatter: dict[str, Any] = dict(payload.get("frontmatter") or {})
         body_excerpt: str = str(payload.get("body_excerpt") or "")
         source_text = f"{frontmatter}\n{body_excerpt}"
+        result.source_text = source_text
         logger.info(
             "  parsed: title=%r village=%r",
             parsed_data.get("title"), parsed_data.get("village"),
         )
-
         # 2. Compose + validate persona.
         persona_text, persona_cost, persona_calls = _compose_with_validation(
             field_name="persona",
@@ -450,7 +393,6 @@ def process_one_dossier(
         )
         result.cost_usd += persona_cost
         result.compose_calls += persona_calls
-
         # 3. Compose + validate description.
         desc_text, desc_cost, desc_calls = _compose_with_validation(
             field_name="description",
@@ -463,7 +405,6 @@ def process_one_dossier(
         )
         result.cost_usd += desc_cost
         result.compose_calls += desc_calls
-
         # 4. Score description, retry once if low.
         final_desc, final_score, score_cost, score_calls = _score_with_retry(
             description=desc_text,
@@ -477,7 +418,6 @@ def process_one_dossier(
         result.cost_usd += score_cost
         result.compose_calls += score_calls
         result.editorial_score = final_score
-
         # 5. Compose editorial title. The parser's title is the Airbnb
         # SEO heading ("Beautiful 7BR Country Farmhouse with Yoga
         # Studio"); we replace it with either the source's actual
@@ -492,21 +432,18 @@ def process_one_dossier(
         result.compose_calls += 1
         final_title = title_result.text
         logger.info("  title: %r", final_title)
-
         # 6. Assemble final data and publish (or dry-run report).
         final_data = dict(parsed_data)
         final_data["title"] = final_title
         final_data["description"] = final_desc
         final_data["persona"] = persona_text
         result.final_title = final_title
-
         if dry_run:
             logger.info("  DRY RUN: would publish to EmDash (skipped)")
             result.final_description = final_desc
             result.final_persona = persona_text
             result.skipped = True
             return result
-
         from betty_claw.tools.emdash_writes import _validate_data_for_collection
         # Schema-validate before the write; the EmDash schema rejects
         # malformed data anyway but we want the failure to be on our
@@ -536,13 +473,11 @@ def process_one_dossier(
                     nested_id = nested.get("id")
                     if isinstance(nested_id, str) and nested_id:
                         draft_id = nested_id
-
         result.draft_id = draft_id
         result.final_description = final_desc
         result.final_persona = persona_text
         result.success = True
         return result
-
     except Exception as e:  # broad: per-dossier failures shouldn't kill batch
         logger.exception("  pipeline failed: %s", e)
         result.failed = True
@@ -550,12 +485,9 @@ def process_one_dossier(
         return result
     finally:
         result.duration_s = time.monotonic() - started
-
-
 # ---------------------------------------------------------------------------
 # Batch runner + reporting
 # ---------------------------------------------------------------------------
-
 def run_batch(
     *,
     site_id: str,
@@ -570,7 +502,6 @@ def run_batch(
         token=config.emdash.token,
         url=config.emdash.mcp_url,
     )
-
     voice_doc_path = config.voice_doc_full_path
     if voice_doc_path is None or not voice_doc_path.exists():
         raise FileNotFoundError(
@@ -579,10 +510,8 @@ def run_batch(
         )
     voice_doc_text = voice_doc_path.read_text(encoding="utf-8")
     logger.info("Loaded voice doc: %d bytes", len(voice_doc_text))
-
     pending = list_pending_dossiers(config, emdash)
     logger.info("Found %d pending dossier(s) for site %r", len(pending), site_id)
-
     if dossier_filename:
         pending = [p for p in pending if p.name == dossier_filename]
         if not pending:
@@ -592,7 +521,6 @@ def run_batch(
     if limit is not None:
         pending = pending[:limit]
         logger.info("Limited to first %d dossier(s)", limit)
-
     batch = BatchResult()
     for i, dossier_path in enumerate(pending, start=1):
         logger.info(
@@ -622,11 +550,8 @@ def run_batch(
             result.editorial_score if result.editorial_score is not None else "-",
             result.cost_usd, result.duration_s,
         )
-
     batch.duration_s = time.monotonic() - started
     return batch
-
-
 def print_summary(batch: BatchResult) -> None:
     """Render the end-of-run report to stdout."""
     print()
@@ -657,12 +582,65 @@ def print_summary(batch: BatchResult) -> None:
         print()
         print(f"Skipped (dry run or filter): {len(batch.skipped)} dossier(s)")
     print()
+# ---------------------------------------------------------------------------
+# Handoff report (Phase A — Contract v1)
+# ---------------------------------------------------------------------------
+_PIPELINE_VERSION = "3.0"
 
 
+def write_handoff_report(batch: BatchResult, args: argparse.Namespace) -> None:
+    """Emit the Contract v1 run report + ready-file into the shared Drive
+    handoff folder for the Claude judge. Best-effort; never crashes the run.
+    Only published drafts become report items."""
+    handoff_dir = os.environ.get("BETTY_HANDOFF_DIR")
+    if not handoff_dir:
+        logger.info("BETTY_HANDOFF_DIR not set; skipping handoff report.")
+        return
+    successes = [r for r in batch.results if r.success and r.draft_id]
+    if not successes:
+        logger.info("No published drafts this run; no handoff report written.")
+        return
+    items = []
+    sources = []
+    for r in successes:
+        src = r.source_text or ""
+        sources.append((r.dossier_filename, src))
+        body = (
+            f"TITLE: {r.final_title or ''}\n\n"
+            f"PERSONA: {r.final_persona or ''}\n\n"
+            f"DESCRIPTION: {r.final_description or ''}"
+        )
+        items.append(hr.build_item(
+            source_filename=r.dossier_filename,
+            source_text=src,
+            draft_id=r.draft_id,
+            title=r.final_title or "(untitled)",
+            draft_body=body,
+            validator_result={"pass": True, "violations": []},
+            editorial_score=r.editorial_score,
+        ))
+    now = hr.utc_now()
+    run_id = now.replace(":", "") + f"-{args.site}-stays"
+    report = hr.build_report(
+        run_id=run_id,
+        attempt=1,
+        pipeline_version=_PIPELINE_VERSION,
+        site=args.site,
+        input_set_hash=hr.input_set_hash(sources),
+        started_at=now,
+        completed_at=now,
+        batch_limit=args.limit or 0,
+        items=items,
+    )
+    try:
+        ready = hr.write_run_report(report, handoff_dir)
+        logger.info("Handoff report published: %s (%d draft(s))",
+                    ready["report_filename"], ready["record_count"])
+    except ValueError as e:
+        logger.error("Handoff report REJECTED by contract validation: %s", e)
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -691,7 +669,6 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
-
     try:
         batch = run_batch(
             site_id=args.site,
@@ -705,10 +682,8 @@ def main() -> int:
     except Exception as e:
         logger.exception("Batch failed before any dossier processing: %s", e)
         return 1
-
     print_summary(batch)
+    write_handoff_report(batch, args)
     return 0 if not batch.failed else 1
-
-
 if __name__ == "__main__":
     sys.exit(main())
